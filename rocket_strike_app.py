@@ -428,6 +428,14 @@ INDEX_HTML = """<!DOCTYPE html>
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5050"))
     use_static = os.environ.get("USE_STATIC_STATE", "").strip().lower() in ("1", "true", "yes")
+    # On Render (512MB), never train – require pretrained model or static state to avoid OOM
+    pretrained_only = os.environ.get("REQUIRE_PRETRAINED", "").strip().lower() in ("1", "true", "yes")
+    if pretrained_only and not (use_static and LIVE_STATE_FILE.exists()) and not (MODEL_FILE.exists() and joblib):
+        print("ERROR: REQUIRE_PRETRAINED is set but no model or static state found.", flush=True)
+        print("  Run locally: python export_live_state.py", flush=True)
+        print("  Then commit and push: data_cache/model.joblib (and optionally data_cache/live_state.json)", flush=True)
+        print("  Ensure data_cache/ or model.joblib is not in .gitignore.", flush=True)
+        sys.exit(1)
     if use_static and LIVE_STATE_FILE.exists():
         print("Rocket strike web app – loading pre-computed state (no training)...", flush=True)
         if _load_static_state():
@@ -444,12 +452,18 @@ if __name__ == "__main__":
             t = threading.Thread(target=_background_refresh, daemon=True, kwargs={"max_rows": _REFRESH_MAX_ROWS})
             t.start()
         else:
+            if pretrained_only:
+                print("  Failed to load model. Exiting (REQUIRE_PRETRAINED set).", flush=True)
+                sys.exit(1)
             print("  Failed to load model. Falling back to training.", flush=True)
             _train_and_predict()
             if _state["ready"]:
                 t = threading.Thread(target=_background_refresh, daemon=True)
                 t.start()
     else:
+        if pretrained_only:
+            print("ERROR: No model.joblib found. Run export_live_state.py and push data_cache/model.joblib.", flush=True)
+            sys.exit(1)
         print("Rocket strike web app – loading data and training model (may take a minute)...", flush=True)
         _train_and_predict()
         if not _state["ready"]:
@@ -459,5 +473,5 @@ if __name__ == "__main__":
         t = threading.Thread(target=_background_refresh, daemon=True)
         t.start()
     app = create_app()
-    print(f"  Open http://127.0.0.1:{port}", flush=True)
+    print(f"  Listening on 0.0.0.0:{port}", flush=True)
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
