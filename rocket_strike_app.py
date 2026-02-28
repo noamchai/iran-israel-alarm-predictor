@@ -25,6 +25,8 @@ import os
 _env_tqdm = os.environ.get("TQDM_DISABLE")
 os.environ["TQDM_DISABLE"] = "1"
 
+from rocket_strike_hawkes_process import fit_hawkes, hawkes_predict, hawkes_backtest_intensity
+
 from rocket_strike_hazard_nn import (
     FEATURE_COLS_MINUTE,
     build_minute_timeline,
@@ -55,6 +57,7 @@ _state = {
     "ready": False,
     "backtest_5h": None,     # {"times": [iso...], "actual": [0|1...], "pred": [float...]}
     "next_15_probs": None,   # [p1, p2, ..., p15] for next 15 minutes
+    "hawkes_params": None,   # (mu, alpha, beta) fitted Hawkes parameters
 }
 _lock = threading.Lock()
 
@@ -154,6 +157,122 @@ def _extend_backtest_to_now(backtest_5h: dict) -> dict:
     }
 
 
+def _load_all_strike_times_minutes() -> list:
+    """Load ALL historical strike times (minutes from epoch) directly from the alerts CSV.
+    This gives 12,000+ events across 11 years — far more than the in-memory window.
+    Used for Hawkes parameter fitting only (not for current intensity).
+    """
+    from rocket_strike_hazard_nn import GITHUB_ALERTS_CACHE
+    if not GITHUB_ALERTS_CACHE.exists():
+        return []
+    try:
+        raw = pd.read_csv(GITHUB_ALERTS_CACHE)
+        # find the timestamp column
+        date_col = None
+        for c in raw.columns:
+            if str(c).strip().lower() == "alertdate":
+                date_col = c
+                break
+        if date_col is None:
+            for c in raw.columns:
+                if str(c).strip().lower() in ("alert_date", "datetime", "date"):
+                    date_col = c
+                    break
+        if date_col is None:
+            return []
+        # Parse as UTC, deduplicate to minute-level (multiple alerts in same minute = 1 event)
+        ts = pd.to_datetime(raw[date_col], errors="coerce", utc=True).dropna()
+        # Round to minute, deduplicate
+        ts_min = ts.dt.floor("min").drop_duplicates().sort_values()
+        # Use last 2 years — ~7k events, fast MLE, still covers multiple conflict episodes
+        cutoff = ts_min.max() - pd.Timedelta(days=730)
+        ts_min = ts_min[ts_min >= cutoff]
+        epoch = pd.Timestamp("1970-01-01", tz="UTC")
+        minutes = [(t - epoch).total_seconds() / 60.0 for t in ts_min]
+        print(f"  Hawkes training: {len(minutes):,} strike-minutes "
+              f"({ts_min.min().date()} → {ts_min.max().date()}, last 2 years)", flush=True)
+        return minutes
+    except Exception as e:
+        print(f"  Warning: could not load full alert history for Hawkes: {e}", flush=True)
+        return []
+
+
+def _run_hawkes(df: pd.DataFrame) -> dict:
+    """Fit a Hawkes process on ALL historical strike data and return predictions.
+
+    Fitting uses the full alert CSV (12,000+ events, 11 years) for the best
+    parameter estimates.  Current intensity uses only recent strikes from `df`
+    (exponential decay means old events contribute negligibly anyway).
+    """
+    strike_col = "strike" if "strike" in df.columns else "strikes"
+    dt_col     = "datetime" if "datetime" in df.columns else "dt"
+
+    strike_rows = df[df[strike_col] == 1]
+    if len(strike_rows) < 3:
+        return {}
+
+    now_ts  = pd.Timestamp(df[dt_col].iloc[-1])
+    epoch   = pd.Timestamp("1970-01-01", tz="UTC")
+
+    def to_epoch_min(t):
+        ts = pd.Timestamp(t)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("Asia/Jerusalem")
+        return (ts.tz_convert("UTC") - epoch).total_seconds() / 60.0
+
+    now_min = to_epoch_min(now_ts)
+
+    # ---- fit on ALL historical data (11 years, 12k+ events) ------------------
+    all_strike_min = _load_all_strike_times_minutes()
+    if len(all_strike_min) < 10:
+        # fallback: use what's in df
+        all_strike_min = [to_epoch_min(t) for t in strike_rows[dt_col]]
+
+    mu, alpha, beta = fit_hawkes(all_strike_min, verbose=True)
+
+    # ---- current intensity: use recent strikes from df (last 7 days) ---------
+    # Old strikes have exp(-beta*(t_now - t_i)) ≈ 0, so only recent ones matter.
+    cutoff = now_ts - pd.Timedelta(days=7)
+    recent = strike_rows[pd.to_datetime(strike_rows[dt_col]) >= cutoff]
+    if len(recent) < 1:
+        recent = strike_rows
+
+    recent_min = [to_epoch_min(t) for t in recent[dt_col]]
+    past_relative = [t - now_min for t in recent_min]   # negative = past
+
+    per_min, cumulative = hawkes_predict(past_relative, mu, alpha, beta, horizon=60)
+
+    probs = {
+        "1":  cumulative[0],
+        5:    cumulative[4],
+        15:   cumulative[14],
+        60:   cumulative[59],
+    }
+    next_15 = per_min[:15]
+
+    # ---- backtest: Hawkes intensity over last 5 h ----------------------------
+    n_5h     = 5 * 60
+    bt_start = max(0, len(df) - n_5h)
+    bt_df    = df.iloc[bt_start:]
+    bt_times_iso = [pd.Timestamp(t).isoformat() for t in bt_df[dt_col]]
+    bt_actual    = [int(v) for v in bt_df[strike_col]]
+
+    # Use all_strike_min (full history) as "past events" for causal backtest
+    bt_query_min = [to_epoch_min(t) for t in bt_df[dt_col]]
+    bt_pred = hawkes_backtest_intensity(all_strike_min, bt_query_min, mu, alpha, beta)
+
+    return {
+        "hawkes_params": (mu, alpha, beta),
+        "probs":         probs,
+        "next_15_probs": next_15,
+        "backtest_5h": {
+            "times":  bt_times_iso,
+            "actual": bt_actual,
+            "pred":   bt_pred,
+        },
+    }
+
+
 def _compute_backtest_and_next_15(df, model, scaler):
     """Compute last 5h backtest (actual vs pred) and next 15 min curve. Returns (backtest_5h, next_15_probs)."""
     last_idx = len(df) - 1
@@ -214,17 +333,26 @@ def _train_and_predict(max_rows: Optional[int] = None, keep_last_minutes: Option
                 _state["ready"] = False
             return
         model, scaler = train_hazard_nn(X_train, y_train, class_weight_balanced=True)
-        last_idx = len(df) - 1
-        last_X = df.iloc[last_idx][FEATURE_COLS_MINUTE].values.astype(float).reshape(1, -1)
-        p_1 = float(predict_proba_strike(model, scaler, last_X)[0])
-        probs = _derive_horizon_probs_from_current(p_1, WEB_HORIZONS)
-        probs["1"] = p_1
-        backtest_5h, next_15_probs = _compute_backtest_and_next_15(df, model, scaler)
-        if next_15_probs:
-            prod_no_strike = 1.0
-            for p in next_15_probs:
-                prod_no_strike *= max(0.0, min(1.0, 1.0 - p))
-            probs[15] = min(1.0, 1.0 - prod_no_strike)
+        # Hawkes process: uses raw strike times, no feature engineering needed.
+        # Overrides MLP probabilities — more principled for self-exciting events.
+        hk = _run_hawkes(df)
+        if hk:
+            probs        = hk["probs"]
+            backtest_5h  = hk["backtest_5h"]
+            next_15_probs = hk["next_15_probs"]
+        else:
+            # Fall back to MLP if Hawkes fails (too few strikes)
+            last_idx = len(df) - 1
+            last_X = df.iloc[last_idx][FEATURE_COLS_MINUTE].values.astype(float).reshape(1, -1)
+            p_1 = float(predict_proba_strike(model, scaler, last_X)[0])
+            probs = _derive_horizon_probs_from_current(p_1, WEB_HORIZONS)
+            probs["1"] = p_1
+            backtest_5h, next_15_probs = _compute_backtest_and_next_15(df, model, scaler)
+            if next_15_probs:
+                prod_no_strike = 1.0
+                for p in next_15_probs:
+                    prod_no_strike *= max(0.0, min(1.0, 1.0 - p))
+                probs[15] = min(1.0, 1.0 - prod_no_strike)
         now_iso = datetime.now(tz=timezone.utc).isoformat()
         with _lock:
             _state["model"] = model
@@ -233,6 +361,7 @@ def _train_and_predict(max_rows: Optional[int] = None, keep_last_minutes: Option
             _state["updated_at"] = now_iso
             _state["backtest_5h"] = backtest_5h
             _state["next_15_probs"] = next_15_probs
+            _state["hawkes_params"] = hk.get("hawkes_params") if hk else None
             _state["error"] = None
             _state["ready"] = True
     except Exception as e:
@@ -271,20 +400,28 @@ def _refresh_data_only(max_rows: Optional[int] = None, keep_last_minutes: Option
                 print("     Pretrained model gives near-zero predictions (likely out of distribution). Retraining on current window...", flush=True)
                 _train_and_predict(max_rows=_REFRESH_MAX_ROWS, keep_last_minutes=keep_last_minutes, train_on_all=True)
                 return
-        probs = _derive_horizon_probs_from_current(p_1, WEB_HORIZONS)
-        probs["1"] = p_1
-        backtest_5h, next_15_probs = _compute_backtest_and_next_15(df, model, scaler)
-        if next_15_probs:
-            prod_no_strike = 1.0
-            for p in next_15_probs:
-                prod_no_strike *= max(0.0, min(1.0, 1.0 - p))
-            probs[15] = min(1.0, 1.0 - prod_no_strike)
+        # Hawkes overrides MLP for all predictions
+        hk = _run_hawkes(df)
+        if hk:
+            probs         = hk["probs"]
+            backtest_5h   = hk["backtest_5h"]
+            next_15_probs = hk["next_15_probs"]
+        else:
+            probs = _derive_horizon_probs_from_current(p_1, WEB_HORIZONS)
+            probs["1"] = p_1
+            backtest_5h, next_15_probs = _compute_backtest_and_next_15(df, model, scaler)
+            if next_15_probs:
+                prod_no_strike = 1.0
+                for p in next_15_probs:
+                    prod_no_strike *= max(0.0, min(1.0, 1.0 - p))
+                probs[15] = min(1.0, 1.0 - prod_no_strike)
         now_iso = datetime.now(tz=timezone.utc).isoformat()
         with _lock:
             _state["probs"] = probs
             _state["updated_at"] = now_iso
             _state["backtest_5h"] = backtest_5h
             _state["next_15_probs"] = next_15_probs
+            _state["hawkes_params"] = hk.get("hawkes_params") if hk else None
             _state["error"] = None
             _state["ready"] = True
     except Exception as e:
@@ -308,6 +445,14 @@ def create_app():
     def index():
         return render_template_string(INDEX_HTML)
 
+    @app.route("/bg")
+    def background_image():
+        from flask import send_file, abort
+        img = _PROJECT_ROOT / "background.jpg"
+        if not img.exists():
+            abort(404)
+        return send_file(img, mimetype="image/jpeg")
+
     @app.route("/api/probs")
     def api_probs():
         with _lock:
@@ -328,7 +473,18 @@ def create_app():
             }
             if _state.get("backtest_5h"):
                 out["backtest_5h"] = _extend_backtest_to_now(_state["backtest_5h"])
-            out["next_15_probs"] = _state.get("next_15_probs") or []
+            probs15 = _state.get("next_15_probs") or []
+            out["next_15_probs"] = probs15
+            # Compute first minute where cumulative P(≥1 strike) crosses 50%
+            if probs15:
+                cum, prod = 0.0, 1.0
+                next_alarm_min = None
+                for k, p in enumerate(probs15, start=1):
+                    prod *= max(0.0, 1.0 - p)
+                    cum = 1.0 - prod
+                    if cum >= 0.50 and next_alarm_min is None:
+                        next_alarm_min = k
+                out["next_alarm_min"] = next_alarm_min  # None if <50% in 15 min
             return jsonify(out)
 
     return app
@@ -339,7 +495,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Israel Strike Risk Monitor</title>
+  <title>🇮🇱 Israel vs Iran 🇮🇷 Round 2</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
     :root {
@@ -365,8 +521,8 @@ INDEX_HTML = """<!DOCTYPE html>
     }
     /* Header */
     .header {
-      background: linear-gradient(135deg, #1a0a0a 0%, #0f0f18 60%, #0a0a0f 100%);
-      border-bottom: 1px solid rgba(255,60,60,0.15);
+      background: linear-gradient(rgba(0,0,0,0.62), rgba(0,0,0,0.78)), url('/bg') center/cover no-repeat;
+      border-bottom: 1px solid rgba(255,60,60,0.25);
       padding: 1.5rem 2rem 1.25rem;
     }
     .header-inner { max-width: 960px; margin: 0 auto; }
@@ -514,7 +670,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <body>
   <div class="header">
     <div class="header-inner">
-      <h1>Israel Strike Risk Monitor <span>&#x26A0;</span></h1>
+      <h1>🇮🇱 ISRAEL VS. IRAN 🇮🇷 <span>ROUND 2</span></h1>
       <div class="subtitle">AI-predicted P(rocket strike) in the next 5 / 15 / 60 minutes &mdash; from live Tzeva Adom data, refreshed every 5 minutes.</div>
     </div>
   </div>
@@ -556,19 +712,19 @@ INDEX_HTML = """<!DOCTYPE html>
       <span id="nextRefresh"></span>
     </div>
 
+    <!-- Next alarm banner -->
+    <div id="nextAlarmBanner" style="display:none; max-width:960px; margin:0.75rem auto; padding:0.75rem 1.25rem;
+         border-radius:8px; background:rgba(255,68,68,0.12); border:1px solid rgba(255,68,68,0.35);
+         font-size:0.95rem; font-weight:600; color:#ff6060; text-align:center; letter-spacing:0.03em;">
+    </div>
+
     <!-- Backtest chart -->
     <div class="section-header">
-      <h2>Last 5 hours</h2>
-      <span class="section-note" id="chart5hEnd">Actual strikes vs predicted probability</span>
+      <h2>Strike timeline &amp; next strike forecast</h2>
+      <span class="section-note" id="chart5hEnd">Last 20 strikes + forecast of when the next one may occur</span>
     </div>
     <div class="chart-card"><canvas id="chartBacktest"></canvas></div>
 
-    <!-- Next 15 min chart -->
-    <div class="section-header">
-      <h2>Next 15 minutes</h2>
-      <span class="section-note">P(strike in that single minute) &mdash; bars sum into the 15 min probability above</span>
-    </div>
-    <div class="chart-card"><canvas id="chartNext15"></canvas></div>
   </div>
 
   <script>
@@ -590,6 +746,12 @@ INDEX_HTML = """<!DOCTYPE html>
     function levelLabel(l) {
       return { low: 'MINIMAL', mid: 'MODERATE', high: 'HIGH', critical: 'CRITICAL' }[l] || '—';
     }
+    // Use LOCAL time for chart labels so they match the user's clock
+    function fmtLocal(iso) {
+      if (!iso) return '';
+      var d = new Date(iso);
+      return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+    }
     function formatUTC(iso) {
       if (!iso) return '';
       var d = new Date(iso);
@@ -602,39 +764,90 @@ INDEX_HTML = """<!DOCTYPE html>
     var chartBacktest = null, chartNext15 = null;
 
     function updateCharts(data) {
-      // --- Backtest chart ---
+      var probs15 = (data.next_15_probs || []).map(Number);
+
+      // --- Strike timeline: last 20 strikes + "when is the next one?" forecast ---
       if (data.backtest_5h && data.backtest_5h.times && data.backtest_5h.times.length) {
         var times = data.backtest_5h.times;
-        var lastDate = new Date(times[times.length - 1]);
-        var endStr = 'Through ' + formatUTC(times[times.length - 1]) + ' UTC';
-        document.getElementById('chart5hEnd').textContent = endStr;
+        var actData = (data.backtest_5h.actual || []).map(Number);
 
-        var step = 30;
-        var labels = times.map(function(t, i) {
-          return (i % step === 0 || i === times.length - 1) ? formatUTC(t) : '';
+        // Find indices of last 20 actual strikes
+        var strikeIdxs = [];
+        for (var i = actData.length - 1; i >= 0 && strikeIdxs.length < 20; i--) {
+          if (actData[i] === 1) strikeIdxs.unshift(i);
+        }
+        // Slice history from a bit before the first of those strikes
+        var histStart = strikeIdxs.length > 0 ? Math.max(0, strikeIdxs[0] - 10) : Math.max(0, times.length - 60);
+        var histTimes  = times.slice(histStart);
+        var histActual = actData.slice(histStart);
+
+        // Future timestamps (+1m … +15m from NOW)
+        var lastTimeMs = new Date(times[times.length - 1]).getTime();
+        var futureTimes = probs15.map(function(_, i) {
+          return new Date(lastTimeMs + (i + 1) * 60000).toISOString();
         });
-        var predData = (data.backtest_5h.pred || []).map(function(p) { return Math.max(0, Math.min(1, Number(p))); });
-        var actData = data.backtest_5h.actual || [];
+
+        // All times for x-axis
+        var allTimes = histTimes.concat(futureTimes);
+        var nowIdx   = histTimes.length - 1; // index of "NOW" in allTimes
+
+        // Dataset 1: strike markers (tall bar = 1 at each past strike, null elsewhere)
+        var strikeBars = histActual.map(function(v) { return v === 1 ? 1.0 : null; })
+                                   .concat(futureTimes.map(function() { return null; }));
+
+        // Dataset 2: cumulative P(next strike has happened BY minute k after now)
+        // Starts at 0 right after "now", rises to the 15-min card value by +15m
+        var cumFore = [], cprod2 = 1.0;
+        for (var i = 0; i < probs15.length; i++) {
+          cprod2 *= Math.max(0, 1 - probs15[i]);
+          cumFore.push(1 - cprod2);
+        }
+        var cdfData = histTimes.map(function() { return null; }).concat(cumFore);
+
+        // Labels: absolute time in history, "NOW ▶" at boundary, +Nm in future
+        var labels = allTimes.map(function(t, i) {
+          if (i === nowIdx) return 'NOW';
+          if (i > nowIdx)   return '+' + (i - nowIdx) + 'm';
+          var minsFromNow = nowIdx - i;
+          return (minsFromNow % 15 === 0) ? fmtLocal(t) : '';
+        });
+
+        // How many strikes are in this window?
+        var nStrikes = histActual.reduce(function(s, v) { return s + v; }, 0);
+        document.getElementById('chart5hEnd').textContent =
+          nStrikes + ' strikes shown  ·  orange line = cumulative P(next strike has occurred by that minute)';
 
         if (chartBacktest) chartBacktest.destroy();
         chartBacktest = new Chart(document.getElementById('chartBacktest'), {
-          type: 'line',
+          type: 'bar',
           data: {
             labels: labels,
             datasets: [
               {
-                label: 'Actual strike',
-                data: actData,
-                borderColor: 'rgba(34,197,94,0.7)',
-                backgroundColor: 'rgba(34,197,94,0.08)',
-                fill: true, yAxisID: 'y0', tension: 0, pointRadius: 0, borderWidth: 1.5
+                type: 'bar',
+                label: 'Strike',
+                data: strikeBars,
+                backgroundColor: 'rgba(34,197,94,0.85)',
+                borderColor: 'rgba(34,197,94,1)',
+                borderWidth: 0,
+                borderRadius: 2,
+                categoryPercentage: 1.0,
+                barPercentage: 1.0,
+                yAxisID: 'y'
               },
               {
-                label: 'Predicted P(strike)',
-                data: predData,
-                borderColor: '#3b82f6',
-                backgroundColor: 'rgba(59,130,246,0.07)',
-                fill: true, yAxisID: 'y1', tension: 0.25, pointRadius: 0, borderWidth: 2
+                type: 'line',
+                label: 'P(next strike by this minute)',
+                data: cdfData,
+                borderColor: '#f59e0b',
+                backgroundColor: 'rgba(245,158,11,0.10)',
+                borderWidth: 2.5,
+                borderDash: [5, 4],
+                fill: true,
+                tension: 0.3,
+                pointRadius: 0,
+                yAxisID: 'y',
+                spanGaps: false
               }
             ]
           },
@@ -643,58 +856,101 @@ INDEX_HTML = """<!DOCTYPE html>
             interaction: { mode: 'index', intersect: false },
             plugins: {
               legend: { labels: { color: '#888', font: { size: 11 }, boxWidth: 14, padding: 14 } },
-              tooltip: { backgroundColor: '#1e1e28', titleColor: '#aaa', bodyColor: '#ddd', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1 }
+              tooltip: {
+                backgroundColor: '#1e1e28', titleColor: '#aaa', bodyColor: '#ddd',
+                borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1,
+                filter: function(item) { return item.parsed.y !== null && item.parsed.y > 0; },
+                callbacks: {
+                  title: function(items) {
+                    var idx = items[0].dataIndex;
+                    if (idx === nowIdx) return 'NOW';
+                    if (idx > nowIdx)   return 'Forecast +' + (idx - nowIdx) + ' min';
+                    return fmtLocal(allTimes[idx]);
+                  },
+                  label: function(ctx) {
+                    if (ctx.parsed.y === null) return null;
+                    if (ctx.datasetIndex === 0) return 'Strike occurred';
+                    return 'P(next strike by +' + (ctx.dataIndex - nowIdx) + 'm): ' + (ctx.parsed.y * 100).toFixed(1) + '%';
+                  }
+                }
+              }
             },
             scales: {
               x: { ticks: { color: TICK, maxRotation: 0, font: { size: 10 } }, grid: { color: GRID } },
-              y0: { type: 'linear', position: 'left', min: -0.05, max: 1.05,
-                    ticks: { color: TICK, stepSize: 0.5, font: { size: 10 } }, grid: { color: GRID } },
-              y1: { type: 'linear', position: 'right', min: 0, max: 1,
-                    ticks: { color: TICK, font: { size: 10 }, callback: function(v) { return (v*100).toFixed(0)+'%'; } },
-                    grid: { drawOnChartArea: false } }
+              y: { type: 'linear', min: 0, max: 1,
+                   ticks: { color: TICK, font: { size: 10 }, callback: function(v) {
+                     return v === 1 ? 'Strike' : (v * 100).toFixed(0) + '%';
+                   }},
+                   grid: { color: GRID } }
             }
           }
         });
       }
 
-      // --- Next 15 min chart ---
-      var probs15 = data.next_15_probs;
-      if (probs15 && probs15.length > 0) {
-        var values = probs15.map(Number);
-        var maxP = Math.max.apply(null, values);
-        var yMax = Math.max(0.005, maxP * 1.25);
-        var barColors = values.map(function(p) {
-          var l = levelOf(p);
-          return colorFor(l) + 'cc';
+      // --- Next 15 min chart: per-minute bars + cumulative line ---
+      if (probs15.length > 0) {
+        // Cumulative: P(at least one strike by minute k) = 1 - product(1-p[0..k])
+        var cumulative = [], prod = 1.0;
+        for (var i = 0; i < probs15.length; i++) {
+          prod *= Math.max(0, 1 - probs15[i]);
+          cumulative.push(1 - prod);
+        }
+        var maxBar = Math.max.apply(null, probs15);
+        var yMax = Math.max(0.05, Math.max(maxBar, cumulative[cumulative.length-1]) * 1.05);
+        var barColors = probs15.map(function(p) {
+          return colorFor(levelOf(p)) + 'bb';
         });
+        var lbls = Array.from({length: probs15.length}, function(_, i) { return '+' + (i+1) + 'm'; });
 
         if (chartNext15) chartNext15.destroy();
         chartNext15 = new Chart(document.getElementById('chartNext15'), {
           type: 'bar',
           data: {
-            labels: Array.from({length: values.length}, function(_, i) { return i + 1; }),
-            datasets: [{
-              label: 'P(strike this minute)',
-              data: values,
-              backgroundColor: barColors,
-              borderColor: 'transparent',
-              borderRadius: 4,
-              borderWidth: 0
-            }]
+            labels: lbls,
+            datasets: [
+              {
+                type: 'bar',
+                label: 'P(strike in this min)',
+                data: probs15,
+                backgroundColor: barColors,
+                borderColor: 'transparent',
+                borderRadius: 3,
+                borderWidth: 0,
+                yAxisID: 'y'
+              },
+              {
+                type: 'line',
+                label: 'Cumulative P(≥1 strike by this min)',
+                data: cumulative,
+                borderColor: '#f59e0b',
+                backgroundColor: 'transparent',
+                borderWidth: 2,
+                pointRadius: 3,
+                pointBackgroundColor: '#f59e0b',
+                tension: 0.3,
+                yAxisID: 'y'
+              }
+            ]
           },
           options: {
             responsive: true, maintainAspectRatio: true,
+            interaction: { mode: 'index', intersect: false },
             plugins: {
-              legend: { display: false },
-              tooltip: { backgroundColor: '#1e1e28', titleColor: '#aaa', bodyColor: '#ddd',
-                         borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1,
-                         callbacks: { label: function(ctx) { return 'P = ' + (ctx.parsed.y*100).toFixed(2)+'%'; } } }
+              legend: { display: true, labels: { color: '#888', font: { size: 10 }, boxWidth: 12, padding: 12 } },
+              tooltip: {
+                backgroundColor: '#1e1e28', titleColor: '#aaa', bodyColor: '#ddd',
+                borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1,
+                callbacks: {
+                  label: function(ctx) {
+                    return ctx.dataset.label + ': ' + (ctx.parsed.y * 100).toFixed(1) + '%';
+                  }
+                }
+              }
             },
             scales: {
-              x: { title: { display: true, text: 'Minutes from now', color: '#666', font: { size: 11 } },
-                   ticks: { color: TICK, font: { size: 10 } }, grid: { color: GRID } },
+              x: { ticks: { color: TICK, font: { size: 10 } }, grid: { color: GRID } },
               y: { min: 0, max: yMax,
-                   ticks: { color: TICK, font: { size: 10 }, callback: function(v) { return (v*100).toFixed(1)+'%'; } },
+                   ticks: { color: TICK, font: { size: 10 }, callback: function(v) { return (v*100).toFixed(0)+'%'; } },
                    grid: { color: GRID } }
             }
           }
@@ -731,6 +987,19 @@ INDEX_HTML = """<!DOCTYPE html>
       fill.style.background = colorFor(lv);
       badge.textContent = levelLabel(lv);
       badge.className = 'threat-badge ' + lv;
+
+      // Next alarm banner
+      var banner = document.getElementById('nextAlarmBanner');
+      var alarmMin = data.next_alarm_min;
+      if (alarmMin != null) {
+        var alarmTime = new Date(new Date().getTime() + alarmMin * 60000);
+        var hh = alarmTime.getHours().toString().padStart(2,'0');
+        var mm = alarmTime.getMinutes().toString().padStart(2,'0');
+        banner.textContent = '⚠ 50% chance of next strike reached at +' + alarmMin + ' min  (' + hh + ':' + mm + ' local)';
+        banner.style.display = 'block';
+      } else {
+        banner.style.display = 'none';
+      }
 
       // Status
       var updatedAt = (data.updated_at || '').replace('T', ' ').slice(0, 19);
