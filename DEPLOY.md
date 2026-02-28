@@ -1,6 +1,71 @@
 # Deploy IRAN vs ISRAEL round 2 alarm predictor to the internet
 
-The app is a Flask server that trains on startup and listens on `PORT` (set by the host). Use one of the options below.
+**Recommended for Render free tier (512 MB):** Train locally, upload the **model** (not the data). The server loads the model and **fetches recent data from the web every 5 minutes** to update probabilities and graphs. No training on the server, and no need to keep the full dataset.
+
+---
+
+## Quick upload (Render, 512 MB)
+
+1. **Export the model locally:** `python export_live_state.py`  
+   This creates `data_cache/model.joblib` (and optionally `data_cache/live_state.json`).
+
+2. **Push to GitHub and include the model** (do not ignore `data_cache/model.joblib`):
+   ```bash
+   git add data_cache/model.joblib rocket_strike_app.py rocket_strike_hazard_nn.py requirements.txt
+   # If you have .gitignore, ensure data_cache/model.joblib is tracked (e.g. git add -f data_cache/model.joblib)
+   git commit -m "Rocket strike predictor with pretrained model"
+   git push origin main
+   ```
+
+3. **On Render:** New Web Service → connect repo →
+   - **Build command:** `pip install -r requirements.txt`
+   - **Start command:** `python rocket_strike_app.py`
+   - **Environment:** Add variable **REQUIRE_PRETRAINED** = **1** (so the server never trains and avoids out-of-memory; it will only run if `model.joblib` is present).
+   - Do **not** set `USE_STATIC_STATE` (so the app loads the model and refreshes data every 5 min).
+   - Create Web Service.
+
+4. **URL:** Use the URL Render gives you. Free tier may sleep after ~15 min idle; first load after sleep can take 1–2 min.
+
+If you see **"No open ports"** or **"Out of memory"**: the app is trying to train because it didn’t find `model.joblib`. Fix by (1) committing and pushing `data_cache/model.joblib`, and (2) setting **REQUIRE_PRETRAINED=1** in Render so the server never attempts training.
+
+---
+
+## Upload model, update live (recommended)
+
+1. **On your machine** (full data, enough RAM):
+   ```bash
+   python export_live_state.py
+   ```
+   This trains on full data and writes:
+   - `data_cache/model.joblib` – trained model + scaler (upload this)
+   - `data_cache/live_state.json` – optional snapshot
+
+2. **Commit and push** (include the model file):
+   ```bash
+   git add data_cache/model.joblib export_live_state.py rocket_strike_app.py rocket_strike_hazard_nn.py
+   git commit -m "Add pretrained model; server loads it and updates from live data"
+   git push origin main
+   ```
+
+3. **On Render**: Deploy **without** setting `USE_STATIC_STATE`. The app will:
+   - Load the pretrained model from `data_cache/model.joblib`
+   - Fetch only the **last ~120k rows** of alert data (streaming if needed) so it fits in 512 MB
+   - Update probabilities and graphs every **5 minutes** from fresh data
+
+4. **No re-deploy needed to refresh**: The server keeps fetching recent data and updating the dashboard. To refresh the **model** itself (e.g. retrain on newer history), run `export_live_state.py` again and push the new `model.joblib`.
+
+---
+
+## Static graphs only (no live updates)
+
+1. Run `python export_live_state.py` and commit `data_cache/live_state.json`.
+2. On Render set **USE_STATIC_STATE** = **1**. The app will only load the JSON and serve it (no model, no data fetch). To refresh, re-export and push the JSON.
+
+---
+
+## Full app (train on server)
+
+The app is a Flask server that can also train on startup and listen on `PORT`. Use one of the options below if you have enough RAM (e.g. paid instance).
 
 ---
 

@@ -120,6 +120,32 @@ def _load_static_state() -> bool:
         return False
 
 
+def _extend_backtest_to_now(backtest_5h: dict) -> dict:
+    """If backtest_5h ends before current minute (UTC), append minutes so the graph extends to 'now'."""
+    if not backtest_5h or not backtest_5h.get("times"):
+        return backtest_5h
+    times = backtest_5h["times"]
+    last_iso = times[-1]
+    try:
+        last_ts = pd.Timestamp(last_iso)
+    except Exception:
+        return backtest_5h
+    now_utc = datetime.now(tz=timezone.utc)
+    now_floor = now_utc.replace(second=0, microsecond=0)
+    last_utc = last_ts.tz_localize(timezone.utc) if last_ts.tzinfo is None else last_ts
+    if last_utc >= now_floor:
+        return backtest_5h
+    extra_minutes = pd.date_range(start=last_utc + pd.Timedelta(minutes=1), end=now_floor, freq="min")
+    if len(extra_minutes) == 0:
+        return backtest_5h
+    last_pred = backtest_5h["pred"][-1] if backtest_5h.get("pred") else 0.0
+    return {
+        "times": list(times) + [t.isoformat() for t in extra_minutes],
+        "actual": list(backtest_5h["actual"]) + [0] * len(extra_minutes),
+        "pred": list(backtest_5h["pred"]) + [float(last_pred)] * len(extra_minutes),
+    }
+
+
 def _compute_backtest_and_next_15(df, model, scaler):
     """Compute last 5h backtest (actual vs pred) and next 15 min curve. Returns (backtest_5h, next_15_probs)."""
     last_idx = len(df) - 1
@@ -173,6 +199,11 @@ def _train_and_predict():
         probs = _derive_horizon_probs_from_current(p_1, WEB_HORIZONS)
         probs["1"] = p_1
         backtest_5h, next_15_probs = _compute_backtest_and_next_15(df, model, scaler)
+        if next_15_probs:
+            prod_no_strike = 1.0
+            for p in next_15_probs:
+                prod_no_strike *= max(0.0, min(1.0, 1.0 - p))
+            probs[15] = min(1.0, 1.0 - prod_no_strike)
         now_iso = datetime.now(tz=timezone.utc).isoformat()
         with _lock:
             _state["model"] = model
@@ -211,6 +242,11 @@ def _refresh_data_only(max_rows: Optional[int] = None):
         probs = _derive_horizon_probs_from_current(p_1, WEB_HORIZONS)
         probs["1"] = p_1
         backtest_5h, next_15_probs = _compute_backtest_and_next_15(df, model, scaler)
+        if next_15_probs:
+            prod_no_strike = 1.0
+            for p in next_15_probs:
+                prod_no_strike *= max(0.0, min(1.0, 1.0 - p))
+            probs[15] = min(1.0, 1.0 - prod_no_strike)
         now_iso = datetime.now(tz=timezone.utc).isoformat()
         with _lock:
             _state["probs"] = probs
@@ -259,7 +295,7 @@ def create_app():
                 "now": datetime.now(tz=timezone.utc).isoformat(),
             }
             if _state.get("backtest_5h"):
-                out["backtest_5h"] = _state["backtest_5h"]
+                out["backtest_5h"] = _extend_backtest_to_now(_state["backtest_5h"])
             out["next_15_probs"] = _state.get("next_15_probs") or []
             return jsonify(out)
 
