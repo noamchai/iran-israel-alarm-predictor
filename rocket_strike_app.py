@@ -35,6 +35,7 @@ from rocket_strike_hazard_nn import (
     build_sequences_hazard_minute,
     train_hazard_nn,
     predict_proba_strike,
+    evaluate,
     _derive_horizon_probs_from_current,
     _next_hour_features,
 )
@@ -58,11 +59,14 @@ _state = {
     "backtest_5h": None,     # {"times": [iso...], "actual": [0|1...], "pred": [float...]}
     "next_15_probs": None,   # [p1, p2, ..., p60] per-minute probs for next 60 minutes
     "hawkes_params": None,   # (mu, alpha, beta) fitted Hawkes parameters
+    "mins_since_prepare": 999999.0,   # minutes since last prepare-warning alert
+    "prepare_boost_active": False,    # True if Hawkes intensity was boosted by recent prepare alert
 }
 _lock = threading.Lock()
 
-# Use fewer rows on low-memory hosts (e.g. Render free tier 512MB). Set MAX_MINUTE_ROWS=500000 locally for full data.
-MAX_MINUTE_ROWS = int(os.environ.get("MAX_MINUTE_ROWS", "80000"))
+# Use fewer rows on low-memory hosts (e.g. Render free tier 512MB).
+# Default 1,500,000 = last ~2.9 years, covers the Oct 2023+ war so model sees real active periods.
+MAX_MINUTE_ROWS = int(os.environ.get("MAX_MINUTE_ROWS", "1500000"))
 
 # Static state: train locally, export live_state.json, then deploy with USE_STATIC_STATE=1 to only serve graphs (no training on server)
 CACHE_DIR = _PROJECT_ROOT / "data_cache"
@@ -185,10 +189,9 @@ def _load_all_strike_times_minutes() -> list:
                     break
         if date_col is None:
             return []
-        # Filter to actual attack alerts only (matrix_id 1=rockets, 6=drones)
-        # Exclude informational: flash, update, prepare-warning, all-clear (matrix_id 10, etc.)
+        # Filter to rocket alerts only (matrix_id 1=rockets)
         if "matrix_id" in raw.columns:
-            raw = raw[raw["matrix_id"].isin([1, 6])]
+            raw = raw[raw["matrix_id"].isin([1])]
         # Parse as UTC
         ts = pd.to_datetime(raw[date_col], errors="coerce", utc=True).dropna()
         epoch = pd.Timestamp("1970-01-01", tz="UTC")
@@ -270,10 +273,13 @@ def _run_hawkes(df: pd.DataFrame) -> dict:
     # they detect an incoming attack on radar — 2–5 min before actual rocket alerts.
     # If one was issued in the last 10 minutes, boost the Hawkes intensity by
     # treating the prepare-alert as additional excitation (empirically ~2× boost).
+    mins_since_prep = 999999.0
+    prepare_boost_active = False
     if "prepare_alert_in_last_15min" in df.columns:
         recent_prep = int(df["prepare_alert_in_last_15min"].iloc[-1])
         mins_since_prep = float(df["minutes_since_last_prepare"].iloc[-1])
         if recent_prep > 0 and mins_since_prep <= 10:
+            prepare_boost_active = True
             # Scale per-minute probabilities: boost decays as prepare alert ages
             boost = 2.0 * max(0.0, 1.0 - mins_since_prep / 10.0)  # 2× at t=0, 1× at t=10min
             per_min  = [min(1.0, p * (1.0 + boost)) for p in per_min]
@@ -292,8 +298,8 @@ def _run_hawkes(df: pd.DataFrame) -> dict:
     }
     next_15 = per_min[:60]   # send all 60 min so chart extends to match the 60-min card
 
-    # ---- backtest: Hawkes intensity over last 5 h ----------------------------
-    n_5h     = 5 * 60
+    # ---- backtest: Hawkes intensity over last 24 h ---------------------------
+    n_5h     = 24 * 60
     bt_start = max(0, len(df) - n_5h)
     bt_df    = df.iloc[bt_start:]
     bt_times_iso = [pd.Timestamp(t).isoformat() for t in bt_df[dt_col]]
@@ -304,9 +310,11 @@ def _run_hawkes(df: pd.DataFrame) -> dict:
     bt_pred = hawkes_backtest_intensity(all_strike_min, bt_query_min, mu, alpha, beta)
 
     return {
-        "hawkes_params": (mu, alpha, beta),
-        "probs":         probs,
-        "next_15_probs": next_15,
+        "hawkes_params":       (mu, alpha, beta),
+        "probs":               probs,
+        "next_15_probs":       next_15,
+        "mins_since_prepare":  mins_since_prep,
+        "prepare_boost_active": prepare_boost_active,
         "backtest_5h": {
             "times":  bt_times_iso,
             "actual": bt_actual,
@@ -316,9 +324,9 @@ def _run_hawkes(df: pd.DataFrame) -> dict:
 
 
 def _compute_backtest_and_next_15(df, model, scaler):
-    """Compute last 5h backtest (actual vs pred) and next 15 min curve. Returns (backtest_5h, next_15_probs)."""
+    """Compute last 24h backtest (actual vs pred) and next 15 min curve. Returns (backtest_5h, next_15_probs)."""
     last_idx = len(df) - 1
-    n_5h = 5 * 60
+    n_5h = 24 * 60
     start = max(1, last_idx - n_5h + 1)
     X_5h = df.iloc[start - 1 : last_idx][FEATURE_COLS_MINUTE].values.astype(float)
     pred_5h = predict_proba_strike(model, scaler, X_5h)
@@ -375,6 +383,26 @@ def _train_and_predict(max_rows: Optional[int] = None, keep_last_minutes: Option
                 _state["ready"] = False
             return
         model, scaler = train_hazard_nn(X_train, y_train, class_weight_balanced=True)
+        # --- Evaluation ---
+        best_val = getattr(model, "best_validation_score_", None)
+        n_iter = getattr(model, "n_iter_", None)
+        print(f"\n=== MLP Training Complete ===", flush=True)
+        print(f"  Architecture : {model.hidden_layer_sizes}", flush=True)
+        print(f"  Stopped at   : iter {n_iter}", flush=True)
+        if best_val is not None:
+            print(f"  Best val acc : {best_val:.4f}", flush=True)
+        if not train_on_all and len(test_df) >= 2:
+            X_test, y_test = build_sequences_hazard_minute(test_df, horizon_minutes=1)
+            if X_test.size > 0 and len(set(y_test)) >= 2:
+                p_test = predict_proba_strike(model, scaler, X_test)
+                m = evaluate(y_test, p_test)
+                print(f"  Test window  : {test_df['datetime'].min()} → {test_df['datetime'].max()}", flush=True)
+                print(f"  Test samples : {m['n']}  (pos rate {y_test.mean():.4f})", flush=True)
+                print(f"  Test accuracy: {m['accuracy']:.4f}", flush=True)
+                print(f"  Test ROC-AUC : {m['roc_auc']:.4f}", flush=True)
+                print(f"  Test Avg-Prec: {m['average_precision']:.4f}", flush=True)
+                print(f"  Confusion    :\n{m['confusion_matrix']}", flush=True)
+        print("=============================\n", flush=True)
         # Hawkes process: uses raw strike times, no feature engineering needed.
         # Overrides MLP probabilities — more principled for self-exciting events.
         hk = _run_hawkes(df)
@@ -404,6 +432,8 @@ def _train_and_predict(max_rows: Optional[int] = None, keep_last_minutes: Option
             _state["backtest_5h"] = backtest_5h
             _state["next_15_probs"] = next_15_probs
             _state["hawkes_params"] = hk.get("hawkes_params") if hk else None
+            _state["mins_since_prepare"] = hk.get("mins_since_prepare", 999999.0) if hk else 999999.0
+            _state["prepare_boost_active"] = hk.get("prepare_boost_active", False) if hk else False
             _state["error"] = None
             _state["ready"] = True
     except Exception as e:
@@ -464,6 +494,8 @@ def _refresh_data_only(max_rows: Optional[int] = None, keep_last_minutes: Option
             _state["backtest_5h"] = backtest_5h
             _state["next_15_probs"] = next_15_probs
             _state["hawkes_params"] = hk.get("hawkes_params") if hk else None
+            _state["mins_since_prepare"] = hk.get("mins_since_prepare", 999999.0) if hk else 999999.0
+            _state["prepare_boost_active"] = hk.get("prepare_boost_active", False) if hk else False
             _state["error"] = None
             _state["ready"] = True
     except Exception as e:
@@ -472,10 +504,12 @@ def _refresh_data_only(max_rows: Optional[int] = None, keep_last_minutes: Option
 
 
 def _background_refresh(max_rows: Optional[int] = None, keep_last_minutes: Optional[int] = None):
-    """Run data refresh every 60 seconds. When max_rows set, use recent-only fetch (for pretrained model)."""
+    """Run data refresh targeting 60 seconds per cycle. When max_rows set, use recent-only fetch (for pretrained model)."""
     while True:
-        time.sleep(60)  # 1 minute
+        t0 = time.time()
         _refresh_data_only(max_rows=max_rows, keep_last_minutes=keep_last_minutes)
+        elapsed = time.time() - t0
+        time.sleep(max(0, 60 - elapsed))  # target 60s total cycle
 
 
 def create_app():
@@ -512,6 +546,8 @@ def create_app():
                 "p_60": _state["probs"][60],
                 "updated_at": _state["updated_at"],
                 "now": datetime.now(tz=timezone.utc).isoformat(),
+                "mins_since_prepare": _state.get("mins_since_prepare", 999999.0),
+                "prepare_boost_active": _state.get("prepare_boost_active", False),
             }
             if _state.get("backtest_5h"):
                 out["backtest_5h"] = _extend_backtest_to_now(_state["backtest_5h"])
@@ -709,7 +745,7 @@ INDEX_HTML = """<!DOCTYPE html>
       padding: 1rem 1rem 0.75rem;
       margin-bottom: 1rem;
     }
-    .chart-card canvas { display: block; max-height: 200px; }
+    .chart-card canvas { display: block; max-height: 260px; }
     /* Error */
     .err-box {
       background: rgba(255,68,68,0.08);
@@ -765,6 +801,10 @@ INDEX_HTML = """<!DOCTYPE html>
     <div class="status-row">
       <span><span class="live-dot"></span><span id="updated">Loading&hellip;</span></span>
       <span id="nextRefresh"></span>
+    </div>
+    <div id="prepareAlertBanner" style="display:none; max-width:960px; margin:0.5rem auto; padding:0.6rem 1.25rem;
+         border-radius:8px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.4);
+         font-size:0.9rem; font-weight:600; color:#f59e0b; text-align:center; letter-spacing:0.03em;">
     </div>
 
     <!-- Next alarm banner -->
@@ -826,15 +866,15 @@ INDEX_HTML = """<!DOCTYPE html>
         var times = data.backtest_5h.times;
         var actData = (data.backtest_5h.actual || []).map(Number);
 
-        // Find indices of last 20 actual strikes
-        var strikeIdxs = [];
-        for (var i = actData.length - 1; i >= 0 && strikeIdxs.length < 20; i--) {
-          if (actData[i] === 1) strikeIdxs.unshift(i);
+        // Trim to start 30 min before the first strike (skip empty early-morning)
+        // With 24h of data, bars become <1px wide and invisible unless we trim
+        var firstStrikeIdx = 0;
+        for (var fi = 0; fi < actData.length; fi++) {
+          if (actData[fi] === 1) { firstStrikeIdx = fi; break; }
         }
-        // Slice history from a bit before the first of those strikes
-        var histStart = strikeIdxs.length > 0 ? Math.max(0, strikeIdxs[0] - 10) : Math.max(0, times.length - 60);
-        var histTimes  = times.slice(histStart);
-        var histActual = actData.slice(histStart);
+        var trimStart = Math.max(0, firstStrikeIdx - 30);
+        var histTimes  = times.slice(trimStart);
+        var histActual = actData.slice(trimStart);
 
         // Future timestamps (+1m … +15m from NOW)
         var lastTimeMs = new Date(times[times.length - 1]).getTime();
@@ -865,13 +905,14 @@ INDEX_HTML = """<!DOCTYPE html>
           if (i === nowIdx) return 'NOW';
           if (i > nowIdx)   return '+' + (i - nowIdx) + 'm';
           var minsFromNow = nowIdx - i;
-          return (minsFromNow % 15 === 0) ? fmtLocal(t) : '';
+          return (minsFromNow % 30 === 0) ? fmtLocal(t) : '';
         });
 
         // How many strikes are in this window?
         var nStrikes = histActual.reduce(function(s, v) { return s + v; }, 0);
+        var windowHours = Math.round(histTimes.length / 60 * 10) / 10;
         document.getElementById('chart5hEnd').textContent =
-          nStrikes + ' strikes shown  ·  orange line = cumulative P(next strike has occurred by that minute)';
+          nStrikes + ' strikes in last ' + windowHours + 'h  ·  orange line = cumulative P(next strike by that minute)';
 
         if (chartBacktest) chartBacktest.destroy();
         chartBacktest = new Chart(document.getElementById('chartBacktest'), {
@@ -1055,6 +1096,23 @@ INDEX_HTML = """<!DOCTYPE html>
         banner.style.display = 'block';
       } else {
         banner.style.display = 'none';
+      }
+
+      // Prepare-alert banner
+      var prepBanner = document.getElementById('prepareAlertBanner');
+      if (data.prepare_boost_active) {
+        var minsAgo = Math.round(data.mins_since_prepare || 0);
+        prepBanner.textContent = '\u26a0 Prepare-warning alert issued ' + minsAgo + ' min ago \u2014 Hawkes intensity boosted';
+        prepBanner.style.display = 'block';
+      } else if ((data.mins_since_prepare || 999999) < 60) {
+        var minsAgo = Math.round(data.mins_since_prepare);
+        prepBanner.textContent = '\u2139 Last prepare-warning: ' + minsAgo + ' min ago (boost expired)';
+        prepBanner.style.color = '#94a3b8';
+        prepBanner.style.background = 'rgba(148,163,184,0.07)';
+        prepBanner.style.borderColor = 'rgba(148,163,184,0.2)';
+        prepBanner.style.display = 'block';
+      } else {
+        prepBanner.style.display = 'none';
       }
 
       // Status

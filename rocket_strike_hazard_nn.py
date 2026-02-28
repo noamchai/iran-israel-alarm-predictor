@@ -261,7 +261,7 @@ def _minute_timeline_from_parsed_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     #   matrix_id 1 = rocket/missile fire (ירי רקטות וטילים)
     #   matrix_id 6 = hostile aircraft/drones (חדירת כלי טיס עוין)
     if "matrix_id" in df.columns:
-        df = df[df["matrix_id"].isin([1, 6])].copy()
+        df = df[df["matrix_id"].isin([1])].copy()
         if df.empty:
             return None
 
@@ -934,8 +934,8 @@ def _balanced_oversample(X: np.ndarray, y: np.ndarray, random_state: int = 42) -
     if n_pos == 0 or n_neg == 0:
         return X, y
     rng = np.random.default_rng(random_state)
-    # Target: at least 20% positives (or match neg count if few positives)
-    n_pos_target = max(n_pos * 3, min(n_neg // 4, n_pos * 10))
+    # Target 1:1 ratio (50% positives) — model can't cheat with all-zeros since baseline accuracy = 50%
+    n_pos_target = n_neg
     n_extra = n_pos_target - n_pos
     if n_extra <= 0:
         return X, y
@@ -948,8 +948,8 @@ def _balanced_oversample(X: np.ndarray, y: np.ndarray, random_state: int = 42) -
 def train_hazard_nn(
     X: np.ndarray,
     y: np.ndarray,
-    hidden_layer_sizes: tuple = (64, 32),
-    max_iter: int = 500,
+    hidden_layer_sizes: tuple = (256, 128, 64, 32),
+    max_iter: int = 1000,
     random_state: int = 42,
     class_weight_balanced: bool = True,
 ) -> tuple:
