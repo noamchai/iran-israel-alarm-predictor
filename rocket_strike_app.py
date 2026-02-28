@@ -158,8 +158,11 @@ def _extend_backtest_to_now(backtest_5h: dict) -> dict:
 
 
 def _load_all_strike_times_minutes() -> list:
-    """Load ALL historical strike times (minutes from epoch) directly from the alerts CSV.
-    This gives 12,000+ events across 11 years — far more than the in-memory window.
+    """Load historical strike times (minutes from epoch) from the alerts CSV.
+
+    Filters to conflict-active days only (days with >= 5 strikes) so that Hawkes
+    parameters (especially μ) are calibrated to conflict intensity rather than
+    diluted by quiet peacetime periods.
     Used for Hawkes parameter fitting only (not for current intensity).
     """
     from rocket_strike_hazard_nn import GITHUB_ALERTS_CACHE
@@ -180,17 +183,22 @@ def _load_all_strike_times_minutes() -> list:
                     break
         if date_col is None:
             return []
-        # Parse as UTC, deduplicate to minute-level (multiple alerts in same minute = 1 event)
+        # Parse as UTC
         ts = pd.to_datetime(raw[date_col], errors="coerce", utc=True).dropna()
-        # Round to minute, deduplicate
-        ts_min = ts.dt.floor("min").drop_duplicates().sort_values()
-        # Use last 2 years — ~7k events, fast MLE, still covers multiple conflict episodes
-        cutoff = ts_min.max() - pd.Timedelta(days=730)
-        ts_min = ts_min[ts_min >= cutoff]
+        # Build a DataFrame with date (UTC) to count strikes per day
+        df_ts = pd.DataFrame({"ts": ts})
+        df_ts["date"] = df_ts["ts"].dt.date
+        daily_counts = df_ts.groupby("date").size()
+        # Keep only conflict-active days (>= 5 raw alerts per day)
+        active_dates = set(daily_counts[daily_counts >= 5].index)
+        df_ts = df_ts[df_ts["date"].isin(active_dates)]
+        # Deduplicate to minute-level within active days
+        ts_min = df_ts["ts"].dt.floor("min").drop_duplicates().sort_values()
         epoch = pd.Timestamp("1970-01-01", tz="UTC")
         minutes = [(t - epoch).total_seconds() / 60.0 for t in ts_min]
-        print(f"  Hawkes training: {len(minutes):,} strike-minutes "
-              f"({ts_min.min().date()} → {ts_min.max().date()}, last 2 years)", flush=True)
+        print(f"  Hawkes training: {len(minutes):,} strike-minutes on "
+              f"{len(active_dates)} conflict-active days "
+              f"({ts_min.min().date()} → {ts_min.max().date()})", flush=True)
         return minutes
     except Exception as e:
         print(f"  Warning: could not load full alert history for Hawkes: {e}", flush=True)
@@ -430,9 +438,9 @@ def _refresh_data_only(max_rows: Optional[int] = None, keep_last_minutes: Option
 
 
 def _background_refresh(max_rows: Optional[int] = None, keep_last_minutes: Optional[int] = None):
-    """Run data refresh every 5 minutes. When max_rows set, use recent-only fetch (for pretrained model)."""
+    """Run data refresh every 60 seconds. When max_rows set, use recent-only fetch (for pretrained model)."""
     while True:
-        time.sleep(300)  # 5 minutes
+        time.sleep(60)  # 1 minute
         _refresh_data_only(max_rows=max_rows, keep_last_minutes=keep_last_minutes)
 
 
