@@ -703,29 +703,16 @@ def hazard_features_minute(df: pd.DataFrame) -> pd.DataFrame:
             pos >= 0, (i_arr - strike_idx[pos]).astype(float), 999999.0
         )
     def _rolling_past_sum(s: pd.Series, w: int) -> np.ndarray:
-        r = s.rolling(w, min_periods=1).apply(lambda x: max(0, x.iloc[:-1].sum()), raw=False)
-        return r.fillna(0).values.astype(int)
+        # rolling(w).sum() includes current row; subtract it to get past-only sum (causal)
+        r = s.rolling(w, min_periods=1).sum() - s
+        return r.clip(lower=0).fillna(0).values.astype(int)
 
-    chunk = 100_000
     n = len(out)
-    s60 = np.zeros(n, dtype=int)
-    s1440 = np.zeros(n, dtype=int)
-    for start in tqdm(range(0, n, chunk), desc="Rolling (60m)", leave=False):
-        end = min(start + chunk, n)
-        w_start = max(0, start - 60)
-        window = out["strike"].iloc[w_start : end + 60]
-        res = _rolling_past_sum(window, 61)
-        offset = start - w_start
-        s60[start:end] = res[offset : offset + (end - start)]
-    for start in tqdm(range(0, n, chunk), desc="Rolling (24h)", leave=False):
-        end = min(start + chunk, n)
-        w_start = max(0, start - 1440)
-        window = out["strike"].iloc[w_start : end + 1440]
-        res = _rolling_past_sum(window, 1441)
-        offset = start - w_start
-        s1440[start:end] = res[offset : offset + (end - start)]
-    out["strikes_in_last_60min"] = s60
-    out["strikes_in_last_1440min"] = s1440
+    W7D = 10080
+    print("     Computing rolling features (vectorized)...", flush=True)
+    out["strikes_in_last_60min"]   = _rolling_past_sum(out["strike"], 61)
+    out["strikes_in_last_1440min"] = _rolling_past_sum(out["strike"], 1441)
+    out["strikes_in_last_10080min"] = _rolling_past_sum(out["strike"], W7D + 1)
     # Prepare-alert features: "בדקות הקרובות" (coming minutes) warning from Home Front Command
     # precedes actual rocket barrages by 2–5 min — very strong leading indicator
     if "prepare_alert" in out.columns:
@@ -738,30 +725,10 @@ def hazard_features_minute(df: pd.DataFrame) -> pd.DataFrame:
             )
         else:
             out["minutes_since_last_prepare"] = 999999.0
-        # Rolling count of prepare alerts in past 15 min (causal: excludes current minute)
-        p15 = np.zeros(n, dtype=int)
-        for start in range(0, n, chunk):
-            end = min(start + chunk, n)
-            w_start = max(0, start - 15)
-            window = out["prepare_alert"].iloc[w_start : end + 15]
-            res = _rolling_past_sum(window, 16)
-            offset = start - w_start
-            p15[start:end] = res[offset : offset + (end - start)]
-        out["prepare_alert_in_last_15min"] = p15
+        out["prepare_alert_in_last_15min"] = _rolling_past_sum(out["prepare_alert"].fillna(0), 16)
     else:
         out["minutes_since_last_prepare"] = 999999.0
         out["prepare_alert_in_last_15min"] = 0
-    # Deep context: 7-day window (10080 min) so hazard sees longer history
-    W7D = 10080
-    s7d = np.zeros(n, dtype=int)
-    for start in tqdm(range(0, n, chunk), desc="Rolling (7d)", leave=False):
-        end = min(start + chunk, n)
-        w_start = max(0, start - W7D)
-        window = out["strike"].iloc[w_start : end + W7D]
-        res = _rolling_past_sum(window, W7D + 1)
-        offset = start - w_start
-        s7d[start:end] = res[offset : offset + (end - start)]
-    out["strikes_in_last_10080min"] = s7d
     # Log scale for time since strike (helps model use both short and long gaps)
     out["log_minutes_since_strike"] = np.log1p(np.minimum(out["minutes_since_last_strike"], 1e6))
     start = out["datetime"].min()
@@ -895,17 +862,21 @@ def build_sequences_hazard_minute(
     df: pd.DataFrame,
     horizon_minutes: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Per-minute: features at t, target = strike in next horizon_minutes."""
-    X_list, y_list = [], []
-    n_seq = len(df) - horizon_minutes
-    for i in tqdm(range(n_seq), desc="Sequences (minute)", leave=False):
-        row = df.iloc[i]
-        X_list.append(row[FEATURE_COLS_MINUTE].values.astype(float))
-        future = df.iloc[i + 1 : i + 1 + horizon_minutes]["strike"]
-        y_list.append(1 if future.any() else 0)
-    if not X_list:
+    """Per-minute: features at t, target = any strike in next horizon_minutes. Vectorized."""
+    n = len(df)
+    if n <= horizon_minutes:
         return np.empty((0, len(FEATURE_COLS_MINUTE))), np.empty(0)
-    return np.array(X_list), np.array(y_list, dtype=int)
+    X = df[FEATURE_COLS_MINUTE].values.astype(float)[:n - horizon_minutes]
+    strike = df["strike"].values
+    if horizon_minutes == 1:
+        y = strike[1:].astype(int)
+    else:
+        # any strike in [t+1, t+horizon]
+        y = np.array([
+            1 if strike[i + 1 : i + 1 + horizon_minutes].any() else 0
+            for i in range(n - horizon_minutes)
+        ], dtype=int)
+    return X, y
 
 
 def train_test_split_by_minutes(
@@ -926,7 +897,8 @@ def train_test_split_by_minutes(
 # -----------------------------------------------------------------------------
 
 def _balanced_oversample(X: np.ndarray, y: np.ndarray, random_state: int = 42) -> tuple[np.ndarray, np.ndarray]:
-    """Oversample minority class so positives are ~half of negatives (MLPClassifier has no sample_weight)."""
+    """Downsample negatives to 1:1 ratio. Keeps all positives (rare real events), samples equal negatives.
+    Far faster and less memory than oversampling, and forces 50% baseline so model must learn."""
     y = np.asarray(y).ravel()
     pos_idx = np.where(y == 1)[0]
     neg_idx = np.where(y == 0)[0]
@@ -934,14 +906,11 @@ def _balanced_oversample(X: np.ndarray, y: np.ndarray, random_state: int = 42) -
     if n_pos == 0 or n_neg == 0:
         return X, y
     rng = np.random.default_rng(random_state)
-    # Target 1:1 ratio (50% positives) — model can't cheat with all-zeros since baseline accuracy = 50%
-    n_pos_target = n_neg
-    n_extra = n_pos_target - n_pos
-    if n_extra <= 0:
-        return X, y
-    repeat_idx = rng.choice(pos_idx, size=n_extra, replace=True)
-    all_idx = np.concatenate([np.arange(len(y)), repeat_idx])
+    # Downsample negatives to match positives → 50% positive rate, model can't cheat with all-zeros
+    sampled_neg = rng.choice(neg_idx, size=min(n_neg, n_pos), replace=False)
+    all_idx = np.concatenate([pos_idx, sampled_neg])
     rng.shuffle(all_idx)
+    print(f"  Balanced: {n_pos} pos + {len(sampled_neg)} neg (from {n_neg} neg) → {len(all_idx)} total", flush=True)
     return X[all_idx], y[all_idx]
 
 
