@@ -130,19 +130,27 @@ def _extend_backtest_to_now(backtest_5h: dict) -> dict:
         last_ts = pd.Timestamp(last_iso)
     except Exception:
         return backtest_5h
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.tz_localize(timezone.utc)
     now_utc = datetime.now(tz=timezone.utc)
     now_floor = now_utc.replace(second=0, microsecond=0)
-    last_utc = last_ts.tz_localize(timezone.utc) if last_ts.tzinfo is None else last_ts
-    if last_utc >= now_floor:
+    now_ts = pd.Timestamp(now_floor)
+    if last_ts.tzinfo is not None and now_ts.tzinfo is None:
+        now_ts = now_ts.tz_localize(timezone.utc)
+    if last_ts >= now_ts:
         return backtest_5h
-    extra_minutes = pd.date_range(start=last_utc + pd.Timedelta(minutes=1), end=now_floor, freq="min")
-    if len(extra_minutes) == 0:
+    # Cap extension at 2 hours to avoid runaway padding
+    extra = pd.date_range(start=last_ts + pd.Timedelta(minutes=1), end=now_ts, freq="min")
+    if len(extra) > 120:
+        extra = extra[-120:]
+    if len(extra) == 0:
         return backtest_5h
     last_pred = backtest_5h["pred"][-1] if backtest_5h.get("pred") else 0.0
+    extra_iso = [t.isoformat() for t in extra]
     return {
-        "times": list(times) + [t.isoformat() for t in extra_minutes],
-        "actual": list(backtest_5h["actual"]) + [0] * len(extra_minutes),
-        "pred": list(backtest_5h["pred"]) + [float(last_pred)] * len(extra_minutes),
+        "times": list(times) + extra_iso,
+        "actual": list(backtest_5h["actual"]) + [0] * len(extra),
+        "pred": list(backtest_5h["pred"]) + [float(last_pred)] * len(extra),
     }
 
 
@@ -354,10 +362,12 @@ INDEX_HTML = """<!DOCTYPE html>
   <p id="err" class="err" style="display:none"></p>
 
   <h2>Last 5 hours: data vs prediction</h2>
+  <p class="meta" id="chart5hEnd">Through current time (UTC).</p>
   <div class="chart-wrap">
     <canvas id="chartBacktest"></canvas>
   </div>
   <h2>Next 15 minutes: P(strike) per minute</h2>
+  <p class="meta">The 15 min value above = P(at least one strike in next 15 min). Bars = P(strike in that single minute); they often decrease over the 15 min.</p>
   <div class="chart-wrap">
     <canvas id="chartNext15"></canvas>
   </div>
@@ -376,6 +386,11 @@ INDEX_HTML = """<!DOCTYPE html>
     function updateCharts(data) {
       if (data.backtest_5h && data.backtest_5h.times && data.backtest_5h.times.length) {
         var times = data.backtest_5h.times;
+        var lastTime = times[times.length - 1];
+        var lastDate = lastTime ? new Date(lastTime) : null;
+        var endStr = lastDate ? 'Through ' + lastDate.getUTCHours().toString().padStart(2,'0') + ':' + lastDate.getUTCMinutes().toString().padStart(2,'0') + ' UTC' : 'Through current time (UTC).';
+        var el = document.getElementById('chart5hEnd');
+        if (el) el.textContent = endStr;
         var labelEveryMinutes = 30;
         var step = Math.max(1, labelEveryMinutes);
         var labels = times.map(function(_, i) {
