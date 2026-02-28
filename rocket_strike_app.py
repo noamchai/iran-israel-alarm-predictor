@@ -265,6 +265,25 @@ def _run_hawkes(df: pd.DataFrame) -> dict:
 
     per_min, cumulative = hawkes_predict(past_relative, mu, alpha, beta, horizon=60)
 
+    # ---- Prepare-alert boost --------------------------------------------------
+    # "בדקות הקרובות" (coming minutes) alerts are issued by Home Front Command when
+    # they detect an incoming attack on radar — 2–5 min before actual rocket alerts.
+    # If one was issued in the last 10 minutes, boost the Hawkes intensity by
+    # treating the prepare-alert as additional excitation (empirically ~2× boost).
+    if "prepare_alert_in_last_15min" in df.columns:
+        recent_prep = int(df["prepare_alert_in_last_15min"].iloc[-1])
+        mins_since_prep = float(df["minutes_since_last_prepare"].iloc[-1])
+        if recent_prep > 0 and mins_since_prep <= 10:
+            # Scale per-minute probabilities: boost decays as prepare alert ages
+            boost = 2.0 * max(0.0, 1.0 - mins_since_prep / 10.0)  # 2× at t=0, 1× at t=10min
+            per_min  = [min(1.0, p * (1.0 + boost)) for p in per_min]
+            cumulative = []
+            cs = 0.0
+            for p in per_min:
+                cs = min(1.0, cs + p)
+                cumulative.append(cs)
+            print(f"  Prepare-alert boost: {boost:.2f}x (mins_since={mins_since_prep:.0f})", flush=True)
+
     probs = {
         "1":  cumulative[0],
         5:    cumulative[4],

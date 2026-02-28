@@ -232,14 +232,39 @@ def _minute_timeline_from_parsed_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """Build minute-level timeline from a parsed alerts DataFrame with _dt or date+time."""
     if df.empty:
         return None
+
+    # --- Extract prepare-warning minutes BEFORE filtering to strikes ---
+    # "בדקות הקרובות" = "In the coming minutes alerts are expected" — issued by Home Front
+    # Command when they detect an incoming attack on radar; precedes actual rockets by 2–5 min.
+    prepare_minutes = None
+    if "matrix_id" in df.columns and "category_desc" in df.columns:
+        prep_df = df[(df["matrix_id"] == 10) &
+                     (df["category_desc"].str.contains("בדקות הקרובות", na=False))]
+        if not prep_df.empty:
+            for c in prep_df.columns:
+                if str(c).strip().lower() in ("alertdate", "alert_date", "datetime"):
+                    prep_df = prep_df.copy()
+                    prep_df["_dt"] = pd.to_datetime(prep_df[c], errors="coerce")
+                    break
+            else:
+                if "date" in prep_df.columns and "time" in prep_df.columns:
+                    prep_df = prep_df.copy()
+                    prep_df["_dt"] = pd.to_datetime(prep_df["date"] + " " + prep_df["time"],
+                                                     format="%d.%m.%Y %H:%M:%S", errors="coerce")
+            if "_dt" in prep_df.columns:
+                prep_df = prep_df.dropna(subset=["_dt"])
+                if not prep_df.empty:
+                    prep_df["_minute"] = prep_df["_dt"].dt.floor("min")
+                    prepare_minutes = set(prep_df["_minute"].unique())
+
     # Filter to actual attack alerts only:
     #   matrix_id 1 = rocket/missile fire (ירי רקטות וטילים)
     #   matrix_id 6 = hostile aircraft/drones (חדירת כלי טיס עוין)
-    # Exclude informational (matrix_id 10): flash, update, prepare-warning, all-clear, event-ended
     if "matrix_id" in df.columns:
         df = df[df["matrix_id"].isin([1, 6])].copy()
         if df.empty:
             return None
+
     date_col = None
     for c in df.columns:
         if str(c).strip().lower() in ("alertdate", "alert_date", "datetime"):
@@ -267,6 +292,11 @@ def _minute_timeline_from_parsed_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     timeline = timeline.merge(minute_counts, on="datetime", how="left")
     timeline["strike"] = timeline["strike"].fillna(0).astype(int)
     timeline["strike_count"] = timeline["strike_count"].fillna(0).astype(int)
+    # Add prepare_alert column: 1 if a "coming minutes" warning was issued in this exact minute
+    if prepare_minutes:
+        timeline["prepare_alert"] = timeline["datetime"].isin(prepare_minutes).astype(int)
+    else:
+        timeline["prepare_alert"] = 0
     return timeline.sort_values("datetime").reset_index(drop=True)
 
 
@@ -696,6 +726,31 @@ def hazard_features_minute(df: pd.DataFrame) -> pd.DataFrame:
         s1440[start:end] = res[offset : offset + (end - start)]
     out["strikes_in_last_60min"] = s60
     out["strikes_in_last_1440min"] = s1440
+    # Prepare-alert features: "בדקות הקרובות" (coming minutes) warning from Home Front Command
+    # precedes actual rocket barrages by 2–5 min — very strong leading indicator
+    if "prepare_alert" in out.columns:
+        pa = out["prepare_alert"].fillna(0).values.astype(int)
+        pa_idx = np.where(pa == 1)[0]
+        if len(pa_idx) > 0:
+            pos = np.searchsorted(pa_idx, np.arange(n), side="right") - 1
+            out["minutes_since_last_prepare"] = np.where(
+                pos >= 0, (np.arange(n) - pa_idx[pos]).astype(float), 999999.0
+            )
+        else:
+            out["minutes_since_last_prepare"] = 999999.0
+        # Rolling count of prepare alerts in past 15 min (causal: excludes current minute)
+        p15 = np.zeros(n, dtype=int)
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            w_start = max(0, start - 15)
+            window = out["prepare_alert"].iloc[w_start : end + 15]
+            res = _rolling_past_sum(window, 16)
+            offset = start - w_start
+            p15[start:end] = res[offset : offset + (end - start)]
+        out["prepare_alert_in_last_15min"] = p15
+    else:
+        out["minutes_since_last_prepare"] = 999999.0
+        out["prepare_alert_in_last_15min"] = 0
     # Deep context: 7-day window (10080 min) so hazard sees longer history
     W7D = 10080
     s7d = np.zeros(n, dtype=int)
@@ -755,6 +810,9 @@ FEATURE_COLS_MINUTE = [
     "hour",
     "day_of_week",
     "trend",
+    # Prepare-alert features (Home Front Command "coming minutes" warning)
+    "minutes_since_last_prepare",
+    "prepare_alert_in_last_15min",
 ]
 
 
@@ -783,8 +841,12 @@ def _minute_features_at_index(df: pd.DataFrame, strike_array: np.ndarray, idx: i
     hour = row["datetime"].hour
     day_of_week = row["datetime"].dayofweek
     trend = float(row["trend"]) if "trend" in df.columns else 0.0
+    # Prepare-alert features
+    mins_since_prepare = float(row["minutes_since_last_prepare"]) if "minutes_since_last_prepare" in df.columns else 999999.0
+    prep_15 = int(row["prepare_alert_in_last_15min"]) if "prepare_alert_in_last_15min" in df.columns else 0
     return np.array(
-        [minutes_since, log_since, s60, s1440, s7d, minute_of_day, hour, day_of_week, trend],
+        [minutes_since, log_since, s60, s1440, s7d, minute_of_day, hour, day_of_week, trend,
+         mins_since_prepare, prep_15],
         dtype=float,
     )
 
@@ -807,6 +869,9 @@ def _next_hour_features(df: pd.DataFrame, last_idx: int, n_minutes: int = 60) ->
         last_7d = np.concatenate([np.zeros(W7D - len(last_7d), dtype=int), last_7d])
     total_minutes = max(df["minutes_since_start"].max(), 1)
     dt = df["datetime"].iloc[last_idx]
+    # Prepare-alert features: carry forward from last known state (alert ages into the future)
+    base_mins_since_prepare = float(row["minutes_since_last_prepare"]) if "minutes_since_last_prepare" in row.index else 999999.0
+    base_prep_15 = int(row["prepare_alert_in_last_15min"]) if "prepare_alert_in_last_15min" in row.index else 0
     rows = []
     for k in range(1, n_minutes + 1):
         mins_since = base["minutes_since_last_strike"] + k
@@ -819,7 +884,10 @@ def _next_hour_features(df: pd.DataFrame, last_idx: int, n_minutes: int = 60) ->
         hour = dt_k.hour
         day_of_week = dt_k.dayofweek
         trend = (row["minutes_since_start"] + k) / total_minutes
-        rows.append([mins_since, log_since, int(new_60.sum()), int(new_1440.sum()), int(new_7d.sum()), minute_of_day, hour, day_of_week, trend])
+        # Prepare alert ages by k more minutes; count stays same (we don't know future alerts)
+        mins_since_prepare = min(base_mins_since_prepare + k, 999999.0)
+        rows.append([mins_since, log_since, int(new_60.sum()), int(new_1440.sum()), int(new_7d.sum()),
+                     minute_of_day, hour, day_of_week, trend, mins_since_prepare, base_prep_15])
     return np.array(rows, dtype=float)
 
 
