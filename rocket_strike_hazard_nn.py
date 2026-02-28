@@ -546,10 +546,12 @@ def build_minute_timeline(
     use_kaggle: bool = True,
     force_refresh: bool = False,
     max_rows: Optional[int] = None,
+    keep_last_minutes: Optional[int] = None,
 ) -> Optional[pd.DataFrame]:
     """
     Build a continuous per-minute timeline. Tries GitHub (dleshem) first, then Kaggle.
     If max_rows is set, only the last max_rows CSV rows are loaded (low memory, for live-update servers).
+    keep_last_minutes: when set with max_rows, keep this many minutes (default 7d+5h). Use larger (e.g. 30*24*60) for pretrained model so features match training distribution.
     Returns None if no minute-level data available.
     """
     import sys
@@ -580,9 +582,9 @@ def build_minute_timeline(
             minute_df.loc[mask, "strike"] = 1
             minute_df.loc[mask, "strike_count"] = np.maximum(minute_df.loc[mask, "strike_count"].values, 1)
             print(f"     Merged {mask.sum()} strike minute(s) from today (Oref) into timeline.", flush=True)
-    # When using recent-only (max_rows), keep only last 7 days + 5h so timeline is recent and model sees current context
+    # When using recent-only (max_rows), trim to last N minutes. Larger N = closer to full-data feature distribution (for pretrained model).
     if max_rows is not None:
-        max_minutes = 7 * 24 * 60 + 300
+        max_minutes = keep_last_minutes if keep_last_minutes is not None else (7 * 24 * 60 + 300)
         if len(minute_df) > max_minutes:
             minute_df = minute_df.iloc[-max_minutes:].reset_index(drop=True)
             print(f"     Kept last {max_minutes} minutes for recent-only mode.", flush=True)

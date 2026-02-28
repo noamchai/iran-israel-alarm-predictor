@@ -176,24 +176,37 @@ def _compute_backtest_and_next_15(df, model, scaler):
     return backtest_5h, next_15_probs
 
 
-def _train_and_predict():
-    """Build timeline, train 1-min model, compute current probs. Uses true data only."""
+def _train_and_predict(max_rows: Optional[int] = None, keep_last_minutes: Optional[int] = None,
+                       train_on_all: bool = False):
+    """Build timeline, train 1-min model, compute current probs. Uses true data only.
+    keep_last_minutes: trim timeline to this many minutes so train and inference use the same distribution.
+    train_on_all: if True, train on ALL data (no test holdout) – use this for export so the model
+                  learns from the full current window including the most recent active period."""
     try:
-        timeline = build_minute_timeline()
+        timeline = build_minute_timeline(max_rows=max_rows, keep_last_minutes=keep_last_minutes)
         if timeline is None or len(timeline) < 1000:
             with _lock:
                 _state["error"] = "Not enough minute-level data (need GitHub/Kaggle timeline)."
                 _state["ready"] = False
             return
-        if len(timeline) > MAX_MINUTE_ROWS:
+        if max_rows is None and keep_last_minutes is None and len(timeline) > MAX_MINUTE_ROWS:
             timeline = timeline.iloc[-MAX_MINUTE_ROWS:].reset_index(drop=True)
         df = hazard_features_minute(timeline)
-        train_df, test_df = train_test_split_by_minutes(df, test_minutes=7 * 24 * 60)
-        if len(test_df) < 2:
-            n = len(df) - 1
-            split = int(0.8 * n)
-            train_df = df.iloc[: split + 1]
-            test_df = df.iloc[split + 1 :]
+        if train_on_all:
+            # For export: train on ALL rows so the model sees the full current active period.
+            # The train/test split would otherwise put recent strikes in the test set (they'd be
+            # invisible to the model), causing near-zero predictions during sudden escalations.
+            train_df = df
+        else:
+            if max_rows is not None:
+                test_minutes = max(300, int(0.2 * len(df)))
+            else:
+                test_minutes = 7 * 24 * 60
+            train_df, test_df = train_test_split_by_minutes(df, test_minutes=test_minutes)
+            if len(test_df) < 2:
+                n = len(df) - 1
+                split = int(0.8 * n)
+                train_df = df.iloc[: split + 1]
         X_train, y_train = build_sequences_hazard_minute(train_df, horizon_minutes=1)
         if X_train.size == 0 or y_train.sum() == 0:
             with _lock:
@@ -228,9 +241,10 @@ def _train_and_predict():
             _state["ready"] = False
 
 
-def _refresh_data_only(max_rows: Optional[int] = None):
+def _refresh_data_only(max_rows: Optional[int] = None, keep_last_minutes: Optional[int] = None):
     """Re-fetch timeline and features, recompute probs with existing model (no retrain).
-    When max_rows is set, only last max_rows CSV rows are loaded (low memory, live update)."""
+    When max_rows is set, only last max_rows CSV rows are loaded (low memory, live update).
+    keep_last_minutes: when set, keep this many minutes (e.g. 30*24*60) so features match full-data-trained model."""
     with _lock:
         model, scaler = _state.get("model"), _state.get("scaler")
         use_recent = max_rows if max_rows is not None else _REFRESH_MAX_ROWS
@@ -238,7 +252,7 @@ def _refresh_data_only(max_rows: Optional[int] = None):
         _train_and_predict()
         return
     try:
-        timeline = build_minute_timeline(max_rows=use_recent)
+        timeline = build_minute_timeline(max_rows=use_recent, keep_last_minutes=keep_last_minutes)
         if timeline is None or len(timeline) < 100:
             return
         if use_recent is None and len(timeline) > MAX_MINUTE_ROWS:
@@ -247,6 +261,16 @@ def _refresh_data_only(max_rows: Optional[int] = None):
         last_idx = len(df) - 1
         last_X = df.iloc[last_idx][FEATURE_COLS_MINUTE].values.astype(float).reshape(1, -1)
         p_1 = float(predict_proba_strike(model, scaler, last_X)[0])
+        # OOD check: if all predictions in recent window are numerically zero, the pretrained model
+        # is out of distribution (e.g. trained on quiet-period data, now there is high activity).
+        # Trigger a full retrain so the scaler calibrates on current data.
+        if p_1 < 1e-100:
+            sample_X = df.iloc[max(0, last_idx - 59) : last_idx][FEATURE_COLS_MINUTE].values.astype(float)
+            sample_preds = predict_proba_strike(model, scaler, sample_X)
+            if sample_preds.max() < 1e-100:
+                print("     Pretrained model gives near-zero predictions (likely out of distribution). Retraining on current window...", flush=True)
+                _train_and_predict(max_rows=_REFRESH_MAX_ROWS, keep_last_minutes=keep_last_minutes, train_on_all=True)
+                return
         probs = _derive_horizon_probs_from_current(p_1, WEB_HORIZONS)
         probs["1"] = p_1
         backtest_5h, next_15_probs = _compute_backtest_and_next_15(df, model, scaler)
@@ -268,11 +292,11 @@ def _refresh_data_only(max_rows: Optional[int] = None):
             _state["error"] = str(e)
 
 
-def _background_refresh(max_rows: Optional[int] = None):
+def _background_refresh(max_rows: Optional[int] = None, keep_last_minutes: Optional[int] = None):
     """Run data refresh every 5 minutes. When max_rows set, use recent-only fetch (for pretrained model)."""
     while True:
         time.sleep(300)  # 5 minutes
-        _refresh_data_only(max_rows=max_rows)
+        _refresh_data_only(max_rows=max_rows, keep_last_minutes=keep_last_minutes)
 
 
 def create_app():
@@ -315,161 +339,417 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>IRAN vs ISRAEL round 2 alarm predictor</title>
+  <title>Israel Strike Risk Monitor</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
-    :root { --bg: #0f0f12; --card: #1a1a20; --text: #e8e6e3; --muted: #888; --accent: #e74c3c; --ok: #2ecc71; }
-    * { box-sizing: border-box; }
-    body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; min-height: 100vh; padding: 1.5rem; }
-    h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 0.5rem 0; }
-    h2 { font-size: 1rem; font-weight: 600; margin: 1.5rem 0 0.5rem 0; color: var(--muted); }
-    .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 1.5rem; }
-    .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
-    .card { background: var(--card); border-radius: 12px; padding: 1.25rem; text-align: center; border: 1px solid rgba(255,255,255,0.06); }
-    .card .label { font-size: 0.85rem; color: var(--muted); margin-bottom: 0.35rem; }
-    .card .value { font-size: 1.75rem; font-weight: 700; }
-    .card .value.high { color: var(--accent); }
-    .card .value.mid { color: #f39c12; }
-    .card .value.low { color: var(--ok); }
-    .meta { color: var(--muted); font-size: 0.8rem; }
-    .meta .live { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); margin-right: 6px; animation: pulse 2s infinite; }
-    @keyframes pulse { 0%,100%{ opacity:1 } 50%{ opacity:0.5 } }
-    .err { color: var(--accent); margin-top: 1rem; }
-    #next { margin-top: 1rem; font-size: 0.85rem; color: var(--muted); }
-    .chart-wrap { background: var(--card); border-radius: 12px; padding: 1rem; margin-top: 0.5rem; border: 1px solid rgba(255,255,255,0.06); max-width: 900px; height: 220px; }
-    .chart-wrap canvas { max-height: 220px; }
+    :root {
+      --bg: #0a0a0f;
+      --surface: #111118;
+      --card: #16161e;
+      --card-border: rgba(255,255,255,0.07);
+      --text: #e2e0dd;
+      --muted: #666;
+      --muted2: #999;
+      --accent: #ff4444;
+      --warn: #f59e0b;
+      --ok: #22c55e;
+      --blue: #3b82f6;
+      --radius: 14px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    /* Header */
+    .header {
+      background: linear-gradient(135deg, #1a0a0a 0%, #0f0f18 60%, #0a0a0f 100%);
+      border-bottom: 1px solid rgba(255,60,60,0.15);
+      padding: 1.5rem 2rem 1.25rem;
+    }
+    .header-inner { max-width: 960px; margin: 0 auto; }
+    .header h1 {
+      font-size: 1.2rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      color: #fff;
+    }
+    .header h1 span { color: var(--accent); }
+    .header .subtitle {
+      font-size: 0.8rem;
+      color: var(--muted2);
+      margin-top: 0.25rem;
+    }
+    /* Main content */
+    .main { max-width: 960px; margin: 0 auto; padding: 1.5rem 2rem 3rem; }
+    /* Threat level bar */
+    .threat-section { margin-bottom: 1.5rem; }
+    .threat-label-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 0.4rem;
+    }
+    .threat-title { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); }
+    .threat-badge {
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 0.15rem 0.6rem;
+      border-radius: 99px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .threat-badge.low    { background: rgba(34,197,94,0.15);  color: var(--ok);   border: 1px solid rgba(34,197,94,0.3); }
+    .threat-badge.mid    { background: rgba(245,158,11,0.15); color: var(--warn); border: 1px solid rgba(245,158,11,0.3); }
+    .threat-badge.high   { background: rgba(255,68,68,0.15);  color: var(--accent); border: 1px solid rgba(255,68,68,0.3); }
+    .threat-badge.critical { background: rgba(255,68,68,0.25); color: #ff8080; border: 1px solid rgba(255,100,100,0.5); }
+    .threat-track {
+      height: 6px;
+      background: rgba(255,255,255,0.07);
+      border-radius: 99px;
+      overflow: hidden;
+    }
+    .threat-fill {
+      height: 100%;
+      border-radius: 99px;
+      transition: width 0.6s ease, background 0.6s ease;
+      background: var(--ok);
+    }
+    /* Probability cards */
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 0.75rem;
+      margin-bottom: 1.5rem;
+    }
+    @media (max-width: 480px) { .cards { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius);
+      padding: 1.1rem 1rem;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+      transition: border-color 0.4s;
+    }
+    .card::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+      transition: opacity 0.4s;
+      pointer-events: none;
+    }
+    .card.high::before  { background: radial-gradient(ellipse at 50% 0%, rgba(255,68,68,0.12) 0%, transparent 70%); opacity: 1; }
+    .card.high  { border-color: rgba(255,68,68,0.25); }
+    .card.mid::before   { background: radial-gradient(ellipse at 50% 0%, rgba(245,158,11,0.10) 0%, transparent 70%); opacity: 1; }
+    .card.mid   { border-color: rgba(245,158,11,0.2); }
+    .card-horizon { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-bottom: 0.5rem; }
+    .card-value {
+      font-size: 2.2rem;
+      font-weight: 800;
+      line-height: 1;
+      transition: color 0.4s;
+      color: var(--text);
+    }
+    .card.high .card-value  { color: var(--accent); }
+    .card.mid  .card-value  { color: var(--warn); }
+    .card.low  .card-value  { color: var(--ok); }
+    .card-sub { font-size: 0.7rem; color: var(--muted); margin-top: 0.4rem; }
+    /* Status row */
+    .status-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-bottom: 1.75rem;
+      font-size: 0.78rem;
+      color: var(--muted2);
+    }
+    .live-dot {
+      display: inline-block;
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--ok);
+      margin-right: 5px;
+      vertical-align: middle;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse { 0%,100%{ opacity:1; box-shadow:0 0 0 0 rgba(34,197,94,0.5); }
+                       50%{ opacity:0.7; box-shadow:0 0 0 4px rgba(34,197,94,0); } }
+    /* Section headers */
+    .section-header {
+      display: flex;
+      align-items: baseline;
+      gap: 0.6rem;
+      margin: 1.75rem 0 0.35rem;
+    }
+    .section-header h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); font-weight: 600; }
+    .section-header .section-note { font-size: 0.75rem; color: var(--muted); }
+    /* Charts */
+    .chart-card {
+      background: var(--card);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius);
+      padding: 1rem 1rem 0.75rem;
+      margin-bottom: 1rem;
+    }
+    .chart-card canvas { display: block; max-height: 200px; }
+    /* Error */
+    .err-box {
+      background: rgba(255,68,68,0.08);
+      border: 1px solid rgba(255,68,68,0.25);
+      border-radius: 10px;
+      padding: 0.75rem 1rem;
+      color: #ff8080;
+      font-size: 0.85rem;
+      margin-bottom: 1rem;
+    }
   </style>
 </head>
 <body>
-  <h1>IRAN vs ISRAEL round 2 alarm predictor</h1>
-  <p class="sub">P(strike) in the next 5, 15, 60 minutes (from true past data). Data refreshed every 5 minutes.</p>
-  <div class="cards">
-    <div class="card">
-      <div class="label">Next 5 min</div>
-      <div class="value" id="p5">—</div>
-    </div>
-    <div class="card">
-      <div class="label">Next 15 min</div>
-      <div class="value" id="p15">—</div>
-    </div>
-    <div class="card">
-      <div class="label">Next 60 min</div>
-      <div class="value" id="p60">—</div>
+  <div class="header">
+    <div class="header-inner">
+      <h1>Israel Strike Risk Monitor <span>&#x26A0;</span></h1>
+      <div class="subtitle">AI-predicted P(rocket strike) in the next 5 / 15 / 60 minutes &mdash; from live Tzeva Adom data, refreshed every 5 minutes.</div>
     </div>
   </div>
-  <p class="meta"><span class="live"></span> <span id="updated">Waiting for data…</span></p>
-  <p id="next" class="meta"></p>
-  <p id="err" class="err" style="display:none"></p>
 
-  <h2>Last 5 hours: data vs prediction</h2>
-  <p class="meta" id="chart5hEnd">Through current time (UTC).</p>
-  <div class="chart-wrap">
-    <canvas id="chartBacktest"></canvas>
-  </div>
-  <h2>Next 15 minutes: P(strike) per minute</h2>
-  <p class="meta">The 15 min value above = P(at least one strike in next 15 min). Bars = P(strike in that single minute); they often decrease over the 15 min.</p>
-  <div class="chart-wrap">
-    <canvas id="chartNext15"></canvas>
+  <div class="main">
+    <div id="errBox" class="err-box" style="display:none"></div>
+
+    <!-- Threat level -->
+    <div class="threat-section">
+      <div class="threat-label-row">
+        <span class="threat-title">Threat Level (next 15 min)</span>
+        <span class="threat-badge low" id="threatBadge">—</span>
+      </div>
+      <div class="threat-track"><div class="threat-fill" id="threatFill" style="width:0%"></div></div>
+    </div>
+
+    <!-- Probability cards -->
+    <div class="cards">
+      <div class="card" id="card5">
+        <div class="card-horizon">Next 5 min</div>
+        <div class="card-value" id="p5">—</div>
+        <div class="card-sub">P(at least one strike)</div>
+      </div>
+      <div class="card" id="card15">
+        <div class="card-horizon">Next 15 min</div>
+        <div class="card-value" id="p15">—</div>
+        <div class="card-sub">P(at least one strike)</div>
+      </div>
+      <div class="card" id="card60">
+        <div class="card-horizon">Next 60 min</div>
+        <div class="card-value" id="p60">—</div>
+        <div class="card-sub">P(at least one strike)</div>
+      </div>
+    </div>
+
+    <!-- Status row -->
+    <div class="status-row">
+      <span><span class="live-dot"></span><span id="updated">Loading&hellip;</span></span>
+      <span id="nextRefresh"></span>
+    </div>
+
+    <!-- Backtest chart -->
+    <div class="section-header">
+      <h2>Last 5 hours</h2>
+      <span class="section-note" id="chart5hEnd">Actual strikes vs predicted probability</span>
+    </div>
+    <div class="chart-card"><canvas id="chartBacktest"></canvas></div>
+
+    <!-- Next 15 min chart -->
+    <div class="section-header">
+      <h2>Next 15 minutes</h2>
+      <span class="section-note">P(strike in that single minute) &mdash; bars sum into the 15 min probability above</span>
+    </div>
+    <div class="chart-card"><canvas id="chartNext15"></canvas></div>
   </div>
 
   <script>
+    var GRID = 'rgba(255,255,255,0.05)';
+    var TICK = '#555';
+
     function fmtP(p) {
       if (p == null) return '—';
-      return (p * 100).toFixed(2) + '%';
+      var pct = p * 100;
+      return pct < 0.01 ? '<0.01%' : pct.toFixed(pct >= 10 ? 1 : 2) + '%';
     }
-    var chartBacktest = null, chartNext15 = null;
-    function formatTime(iso) {
+    function levelOf(p) {
+      if (p == null) return 'low';
+      if (p >= 0.6) return 'critical';
+      if (p >= 0.3) return 'high';
+      if (p >= 0.1) return 'mid';
+      return 'low';
+    }
+    function levelLabel(l) {
+      return { low: 'MINIMAL', mid: 'MODERATE', high: 'HIGH', critical: 'CRITICAL' }[l] || '—';
+    }
+    function formatUTC(iso) {
       if (!iso) return '';
       var d = new Date(iso);
-      return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+      return d.getUTCHours().toString().padStart(2,'0') + ':' + d.getUTCMinutes().toString().padStart(2,'0');
     }
+    function colorFor(l) {
+      return { low: '#22c55e', mid: '#f59e0b', high: '#ff4444', critical: '#ff6666' }[l] || '#22c55e';
+    }
+
+    var chartBacktest = null, chartNext15 = null;
+
     function updateCharts(data) {
+      // --- Backtest chart ---
       if (data.backtest_5h && data.backtest_5h.times && data.backtest_5h.times.length) {
         var times = data.backtest_5h.times;
-        var lastTime = times[times.length - 1];
-        var lastDate = lastTime ? new Date(lastTime) : null;
-        var endStr = lastDate ? 'Through ' + lastDate.getUTCHours().toString().padStart(2,'0') + ':' + lastDate.getUTCMinutes().toString().padStart(2,'0') + ' UTC' : 'Through current time (UTC).';
-        var el = document.getElementById('chart5hEnd');
-        if (el) el.textContent = endStr;
-        var labelEveryMinutes = 30;
-        var step = Math.max(1, labelEveryMinutes);
-        var labels = times.map(function(_, i) {
-          return (i % step === 0 || i === times.length - 1) ? formatTime(times[i]) : '';
+        var lastDate = new Date(times[times.length - 1]);
+        var endStr = 'Through ' + formatUTC(times[times.length - 1]) + ' UTC';
+        document.getElementById('chart5hEnd').textContent = endStr;
+
+        var step = 30;
+        var labels = times.map(function(t, i) {
+          return (i % step === 0 || i === times.length - 1) ? formatUTC(t) : '';
         });
-        if (chartBacktest) chartBacktest.destroy();
         var predData = (data.backtest_5h.pred || []).map(function(p) { return Math.max(0, Math.min(1, Number(p))); });
+        var actData = data.backtest_5h.actual || [];
+
+        if (chartBacktest) chartBacktest.destroy();
         chartBacktest = new Chart(document.getElementById('chartBacktest'), {
           type: 'line',
           data: {
             labels: labels,
             datasets: [
-              { label: 'Actual strike', data: data.backtest_5h.actual, borderColor: '#2ecc71', backgroundColor: 'rgba(46,204,113,0.2)', fill: true, yAxisID: 'y0', tension: 0, pointRadius: 0, borderWidth: 1 },
-              { label: 'Predicted P(strike)', data: predData, borderColor: '#3498db', backgroundColor: 'rgba(52,152,219,0.1)', fill: true, yAxisID: 'y1', tension: 0.2, pointRadius: 0, borderWidth: 1.5 }
+              {
+                label: 'Actual strike',
+                data: actData,
+                borderColor: 'rgba(34,197,94,0.7)',
+                backgroundColor: 'rgba(34,197,94,0.08)',
+                fill: true, yAxisID: 'y0', tension: 0, pointRadius: 0, borderWidth: 1.5
+              },
+              {
+                label: 'Predicted P(strike)',
+                data: predData,
+                borderColor: '#3b82f6',
+                backgroundColor: 'rgba(59,130,246,0.07)',
+                fill: true, yAxisID: 'y1', tension: 0.25, pointRadius: 0, borderWidth: 2
+              }
             ]
           },
           options: {
-            responsive: true,
-            maintainAspectRatio: true,
+            responsive: true, maintainAspectRatio: true,
             interaction: { mode: 'index', intersect: false },
-            plugins: { legend: { labels: { color: '#e8e6e3' } } },
+            plugins: {
+              legend: { labels: { color: '#888', font: { size: 11 }, boxWidth: 14, padding: 14 } },
+              tooltip: { backgroundColor: '#1e1e28', titleColor: '#aaa', bodyColor: '#ddd', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1 }
+            },
             scales: {
-              x: { ticks: { color: '#888', maxRotation: 0 }, grid: { color: 'rgba(255,255,255,0.06)' } },
-              y0: { type: 'linear', position: 'left', min: -0.05, max: 1, ticks: { color: '#888', stepSize: 0.25 }, grid: { color: 'rgba(255,255,255,0.06)' } },
-              y1: { type: 'linear', position: 'right', min: 0, max: 1, ticks: { color: '#888', callback: function(v) { return (v*100).toFixed(0)+'%'; } }, grid: { drawOnChartArea: false } }
+              x: { ticks: { color: TICK, maxRotation: 0, font: { size: 10 } }, grid: { color: GRID } },
+              y0: { type: 'linear', position: 'left', min: -0.05, max: 1.05,
+                    ticks: { color: TICK, stepSize: 0.5, font: { size: 10 } }, grid: { color: GRID } },
+              y1: { type: 'linear', position: 'right', min: 0, max: 1,
+                    ticks: { color: TICK, font: { size: 10 }, callback: function(v) { return (v*100).toFixed(0)+'%'; } },
+                    grid: { drawOnChartArea: false } }
             }
           }
         });
       }
+
+      // --- Next 15 min chart ---
       var probs15 = data.next_15_probs;
-      if (probs15 && Array.isArray(probs15) && probs15.length > 0) {
+      if (probs15 && probs15.length > 0) {
         var values = probs15.map(Number);
         var maxP = Math.max.apply(null, values);
-        var yMax = Math.max(0.01, maxP * 1.2);
+        var yMax = Math.max(0.005, maxP * 1.25);
+        var barColors = values.map(function(p) {
+          var l = levelOf(p);
+          return colorFor(l) + 'cc';
+        });
+
         if (chartNext15) chartNext15.destroy();
         chartNext15 = new Chart(document.getElementById('chartNext15'), {
           type: 'bar',
           data: {
-            labels: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15].slice(0, values.length),
-            datasets: [{ label: 'P(strike in this minute)', data: values, backgroundColor: 'rgba(52,152,219,0.8)', borderColor: '#3498db', borderWidth: 1 }]
+            labels: Array.from({length: values.length}, function(_, i) { return i + 1; }),
+            datasets: [{
+              label: 'P(strike this minute)',
+              data: values,
+              backgroundColor: barColors,
+              borderColor: 'transparent',
+              borderRadius: 4,
+              borderWidth: 0
+            }]
           },
           options: {
-            responsive: true,
-            maintainAspectRatio: true,
-            plugins: { legend: { display: false } },
+            responsive: true, maintainAspectRatio: true,
+            plugins: {
+              legend: { display: false },
+              tooltip: { backgroundColor: '#1e1e28', titleColor: '#aaa', bodyColor: '#ddd',
+                         borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1,
+                         callbacks: { label: function(ctx) { return 'P = ' + (ctx.parsed.y*100).toFixed(2)+'%'; } } }
+            },
             scales: {
-              x: { title: { display: true, text: 'Minutes from now', color: '#888' }, ticks: { color: '#888' }, grid: { color: 'rgba(255,255,255,0.06)' } },
-              y: { min: 0, max: yMax, ticks: { color: '#888', callback: function(v) { return (v*100).toFixed(1)+'%'; } }, grid: { color: 'rgba(255,255,255,0.06)' } }
+              x: { title: { display: true, text: 'Minutes from now', color: '#666', font: { size: 11 } },
+                   ticks: { color: TICK, font: { size: 10 } }, grid: { color: GRID } },
+              y: { min: 0, max: yMax,
+                   ticks: { color: TICK, font: { size: 10 }, callback: function(v) { return (v*100).toFixed(1)+'%'; } },
+                   grid: { color: GRID } }
             }
           }
         });
       }
     }
+
     function updateUI(data) {
+      var errBox = document.getElementById('errBox');
       if (!data.ok) {
-        document.getElementById('err').textContent = data.error || 'Error';
-        document.getElementById('err').style.display = 'block';
+        errBox.textContent = data.error || 'Error loading data.';
+        errBox.style.display = 'block';
         return;
       }
-      document.getElementById('err').style.display = 'none';
-      var p5 = document.getElementById('p5'), p15 = document.getElementById('p15'), p60 = document.getElementById('p60');
-      p5.textContent = fmtP(data.p_5); p15.textContent = fmtP(data.p_15); p60.textContent = fmtP(data.p_60);
-      p5.className = 'value ' + (data.p_5 >= 0.5 ? 'high' : data.p_5 >= 0.2 ? 'mid' : 'low');
-      p15.className = 'value ' + (data.p_15 >= 0.5 ? 'high' : data.p_15 >= 0.2 ? 'mid' : 'low');
-      p60.className = 'value ' + (data.p_60 >= 0.5 ? 'high' : data.p_60 >= 0.2 ? 'mid' : 'low');
-      document.getElementById('updated').textContent = 'Updated: ' + (data.updated_at || '').replace('T', ' ').slice(0, 19) + ' UTC';
+      errBox.style.display = 'none';
+
+      // Probabilities
+      var vals = { p5: data.p_5, p15: data.p_15, p60: data.p_60 };
+      var ids  = { p5: ['p5','card5'], p15: ['p15','card15'], p60: ['p60','card60'] };
+      Object.keys(vals).forEach(function(k) {
+        var p = vals[k];
+        var l = levelOf(p);
+        document.getElementById(ids[k][0]).textContent = fmtP(p);
+        document.getElementById(ids[k][1]).className = 'card ' + l;
+      });
+
+      // Threat level bar (based on 15 min)
+      var lv = levelOf(data.p_15);
+      var pct = Math.min(100, (data.p_15 || 0) * 100 / 0.6 * 100);  // 60% = full bar
+      pct = Math.max(2, Math.min(100, (data.p_15 || 0) * 166.7));
+      var fill = document.getElementById('threatFill');
+      var badge = document.getElementById('threatBadge');
+      fill.style.width = pct.toFixed(1) + '%';
+      fill.style.background = colorFor(lv);
+      badge.textContent = levelLabel(lv);
+      badge.className = 'threat-badge ' + lv;
+
+      // Status
+      var updatedAt = (data.updated_at || '').replace('T', ' ').slice(0, 19);
+      document.getElementById('updated').textContent = 'Updated ' + updatedAt + ' UTC';
       var next = new Date();
       next.setMinutes(next.getMinutes() + (5 - next.getMinutes() % 5));
       next.setSeconds(0, 0);
-      document.getElementById('next').textContent = 'Next data refresh: ~' + next.toLocaleTimeString();
+      document.getElementById('nextRefresh').textContent = 'Next refresh ~' + next.toLocaleTimeString();
+
       updateCharts(data);
     }
+
     function fetchProbs() {
       fetch('/api/probs').then(function(r) { return r.json(); }).then(updateUI).catch(function(e) {
         updateUI({ ok: false, error: e.message });
       });
     }
     fetchProbs();
-    setInterval(fetchProbs, 30 * 1000);
+    setInterval(fetchProbs, 30000);
   </script>
 </body>
 </html>
@@ -494,13 +774,14 @@ if __name__ == "__main__":
         else:
             print("  Failed to load live_state.json.", _state.get("error"), flush=True)
     elif MODEL_FILE.exists() and joblib is not None:
-        # Load pretrained model; fetch recent data only and update live every 5 min
-        _REFRESH_MAX_ROWS = 120000  # last ~120k CSV rows = enough for 7d context, fits 512MB
+        # Load pretrained model; fetch recent data and update live every 5 min
+        _REFRESH_MAX_ROWS = 120000
+        _KEEP_LAST_MINUTES = 30 * 24 * 60  # 30 days so feature distribution matches full-data-trained model (avoids zero preds)
         print("Rocket strike web app – loading pretrained model (no training)...", flush=True)
         if _load_pretrained_model():
-            print("  Model loaded. Fetching recent data and updating every 5 min.", flush=True)
-            _refresh_data_only(max_rows=_REFRESH_MAX_ROWS)
-            t = threading.Thread(target=_background_refresh, daemon=True, kwargs={"max_rows": _REFRESH_MAX_ROWS})
+            print("  Model loaded. Fetching recent data (30d window) and updating every 5 min.", flush=True)
+            _refresh_data_only(max_rows=_REFRESH_MAX_ROWS, keep_last_minutes=_KEEP_LAST_MINUTES)
+            t = threading.Thread(target=_background_refresh, daemon=True, kwargs={"max_rows": _REFRESH_MAX_ROWS, "keep_last_minutes": _KEEP_LAST_MINUTES})
             t.start()
         else:
             if pretrained_only:
