@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FinanceExp Live</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+:root {
+  --bg-primary: #0d1117;
+  --bg-secondary: #161b22;
+  --bg-tertiary: #1c2333;
+  --bg-card: #21262d;
+  --border: #30363d;
+  --text-primary: #e6edf3;
+  --text-secondary: #8b949e;
+  --text-muted: #6e7681;
+  --green: #3fb950;
+  --green-dim: #238636;
+  --red: #f85149;
+  --red-dim: #da3633;
+  --blue: #58a6ff;
+  --orange: #d29922;
+  --purple: #bc8cff;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  overflow: hidden;
+  height: 100vh;
+}
+
+/* ── Layout ─────────────────────────────────────────────────── */
+.app {
+  display: grid;
+  grid-template-rows: 48px 1fr;
+  grid-template-columns: 260px 1fr 320px;
+  grid-template-areas:
+    "header header header"
+    "sidebar main panel";
+  height: 100vh;
+}
+
+/* ── Header ─────────────────────────────────────────────────── */
+.header {
+  grid-area: header;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  gap: 16px;
+  z-index: 10;
+}
+.header .logo {
+  font-weight: 700;
+  font-size: 16px;
+  letter-spacing: 1px;
+  color: var(--blue);
+}
+.header .logo span { color: var(--text-muted); font-weight: 400; }
+.badge {
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.badge-training { background: var(--orange); color: #000; }
+.badge-ready { background: var(--green-dim); color: var(--green); }
+.badge-error { background: var(--red-dim); color: #fff; }
+.badge-connected { background: var(--green-dim); color: var(--green); }
+.badge-disconnected { background: var(--red-dim); color: var(--red); }
+.badge-market-open { background: var(--green-dim); color: var(--green); }
+.badge-market-closed { background: var(--bg-card); color: var(--text-muted); border: 1px solid var(--border); }
+.header .spacer { flex: 1; }
+.header .clock {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.btn {
+  padding: 4px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background .15s;
+}
+.btn:hover { background: var(--bg-tertiary); }
+.btn:active { background: var(--border); }
+
+/* ── Sidebar ────────────────────────────────────────────────── */
+.sidebar {
+  grid-area: sidebar;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.sidebar-header {
+  padding: 12px 16px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  letter-spacing: .5px;
+  position: sticky;
+  top: 0;
+  background: var(--bg-secondary);
+  z-index: 2;
+}
+.sidebar-search {
+  padding: 0 12px 8px;
+  position: sticky;
+  top: 28px;
+  background: var(--bg-secondary);
+  z-index: 2;
+}
+.sidebar-search input {
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+  outline: none;
+}
+.sidebar-search input:focus { border-color: var(--blue); }
+.ticker-item {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  padding: 8px 16px;
+  cursor: pointer;
+  transition: background .1s;
+  border-bottom: 1px solid rgba(48,54,61,.3);
+  gap: 8px;
+}
+.ticker-item:hover { background: var(--bg-tertiary); }
+.ticker-item.active { background: var(--bg-card); border-left: 3px solid var(--blue); }
+.ticker-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+.ticker-price {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 12px;
+  text-align: right;
+}
+.ticker-change {
+  font-size: 11px;
+  font-weight: 600;
+  text-align: right;
+  min-width: 50px;
+}
+.up { color: var(--green); }
+.down { color: var(--red); }
+.neutral { color: var(--text-muted); }
+.ticker-pred-arrow {
+  font-size: 10px;
+  margin-left: 4px;
+}
+
+/* ── Main chart ─────────────────────────────────────────────── */
+.main {
+  grid-area: main;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.chart-header {
+  display: flex;
+  align-items: center;
+  padding: 12px 20px;
+  gap: 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-secondary);
+}
+.chart-ticker {
+  font-size: 20px;
+  font-weight: 700;
+}
+.chart-price-big {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 22px;
+  font-weight: 600;
+}
+.chart-change-big {
+  font-size: 14px;
+  font-weight: 600;
+}
+.prediction-badge {
+  margin-left: auto;
+  padding: 6px 14px;
+  border-radius: 8px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  font-size: 12px;
+}
+.prediction-badge .label { color: var(--text-muted); }
+.prediction-badge .value {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-weight: 600;
+  margin-left: 6px;
+}
+.chart-container {
+  flex: 1;
+  position: relative;
+  min-height: 0;
+}
+
+/* ── Right panel ────────────────────────────────────────────── */
+.panel {
+  grid-area: panel;
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.panel-section {
+  border-bottom: 1px solid var(--border);
+}
+.panel-title {
+  padding: 12px 16px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  letter-spacing: .5px;
+}
+.metrics-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  padding: 0 12px 12px;
+}
+.metric-card {
+  background: var(--bg-card);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 4px;
+}
+.metric-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+.metric-value {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+/* ── Prediction history table ───────────────────────────────── */
+.pred-history {
+  flex: 1;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.pred-row {
+  display: grid;
+  grid-template-columns: 60px 1fr 70px 70px 50px 36px;
+  align-items: center;
+  padding: 6px 12px;
+  font-size: 11px;
+  border-bottom: 1px solid rgba(48,54,61,.3);
+  gap: 4px;
+}
+.pred-row.header {
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  position: sticky;
+  top: 0;
+  background: var(--bg-secondary);
+}
+.pred-time { font-family: 'SF Mono', 'Fira Code', monospace; color: var(--text-secondary); }
+.pred-ticker { font-weight: 600; }
+.pred-price { font-family: 'SF Mono', 'Fira Code', monospace; text-align: right; }
+.pred-err { text-align: right; }
+.pred-dir { text-align: center; font-size: 14px; }
+
+/* ── Toast ──────────────────────────────────────────────────── */
+.toast-container {
+  position: fixed;
+  top: 60px;
+  right: 16px;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.toast {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 16px;
+  font-size: 13px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  animation: slideIn .3s ease-out;
+  max-width: 340px;
+}
+.toast .toast-title { font-weight: 600; margin-bottom: 2px; }
+.toast .toast-body { color: var(--text-secondary); font-size: 12px; }
+@keyframes slideIn {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+/* ── Loading overlay ────────────────────────────────────────── */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(13,17,23,.92);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+  flex-direction: column;
+  gap: 20px;
+}
+.overlay.hidden { display: none; }
+.spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid var(--border);
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.overlay-text { font-size: 15px; color: var(--text-secondary); }
+
+/* scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div class="overlay" id="overlay">
+  <div class="spinner"></div>
+  <div class="overlay-text" id="overlayText">Training model on historical data...</div>
+</div>
+
+<div class="toast-container" id="toasts"></div>
+
+<div class="app">
+  <!-- Header -->
+  <div class="header">
+    <div class="logo">FINANCEEXP <span>LIVE</span></div>
+    <span class="badge badge-training" id="statusBadge">INITIALIZING</span>
+    <span class="badge badge-disconnected" id="connBadge">DISCONNECTED</span>
+    <span class="badge badge-market-closed" id="marketBadge">MARKET CLOSED</span>
+    <div class="spacer"></div>
+    <button class="btn" id="btnRetrain">Retrain</button>
+    <button class="btn" id="btnFetchFresh" style="color:var(--orange)">Fetch Fresh</button>
+    <div class="clock" id="clock">--:--:--</div>
+  </div>
+
+  <!-- Sidebar: ticker list -->
+  <div class="sidebar">
+    <div class="sidebar-header">Watchlist (<span id="tickerCount">0</span>)</div>
+    <div class="sidebar-search">
+      <input type="text" id="tickerSearch" placeholder="Search tickers...">
+    </div>
+    <div id="tickerList"></div>
+  </div>
+
+  <!-- Main chart -->
+  <div class="main">
+    <div class="chart-header">
+      <div class="chart-ticker" id="chartTicker">--</div>
+      <div class="chart-price-big" id="chartPrice">--</div>
+      <div class="chart-change-big neutral" id="chartChange">--</div>
+      <div class="prediction-badge">
+        <span class="label" id="chartPredLabel">Next:</span>
+        <span class="value" id="chartPredPrice">--</span>
+        <span class="value" id="chartPredDir"></span>
+      </div>
+      <div style="display:flex;gap:12px;font-size:11px;color:var(--text-muted);align-items:center;">
+        <span><span style="color:#8b949e;">━</span> Test Actual</span>
+        <span><span style="color:#3fb950;">╌</span> 1-Step</span>
+        <span><span style="color:#d29922;">╌</span> <span id="extendedPredLabel">Next 10 days</span></span>
+        <span><span style="color:#39d2c0;">╌</span> Factor TF</span>
+        <span><span style="color:#a371f7;">╌</span> FT propagated (no true)</span>
+        <span><span style="color:#58a6ff;">━</span> Live Actual</span>
+        <span><span style="color:#bc8cff;">╌</span> VAR Pred</span>
+        <span><span style="color:#39d2c0;">┈</span> FT Trajectory</span>
+      </div>
+    </div>
+    <div class="chart-container" id="chartContainer"></div>
+  </div>
+
+  <!-- Right panel -->
+  <div class="panel">
+    <div class="panel-section">
+      <div class="panel-title">Model Info</div>
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-label">Stocks</div>
+          <div class="metric-value" id="metricStocks">--</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Lag</div>
+          <div class="metric-value" id="metricLag">--</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Train Bars</div>
+          <div class="metric-value" id="metricBars">--</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Slices</div>
+          <div class="metric-value" id="metricSlices">--</div>
+        </div>
+      </div>
+    </div>
+    <div class="panel-section">
+      <div class="panel-title">Live Stats</div>
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-label">Predictions</div>
+          <div class="metric-value" id="metricPreds">0</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Avg Error</div>
+          <div class="metric-value" id="metricAvgErr">--</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Dir. Accuracy</div>
+          <div class="metric-value" id="metricDirAcc">--</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Updates</div>
+          <div class="metric-value" id="metricUpdates">0</div>
+        </div>
+      </div>
+    </div>
+    <div class="panel-title">Prediction History</div>
+    <div class="pred-history" id="predHistory">
+      <div class="pred-row header">
+        <div>Time</div><div>Ticker</div><div>Predicted</div><div>Actual</div><div>Err%</div><div>Dir</div>
+      </div>
+      <div id="predRows"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const socket = io();
+let tickers = [];
+let selectedTicker = null;
+let priceData = {};       // {ticker: [{time, value}]}
+let livePredData = {};    // {ticker: [{time, value}]} accumulated 1-min predictions
+let latestPrices = {};
+let prevPrices = {};
+let activePrediction = null;
+let predictionHistory = [];
+let updateCount = 0;
+let chart = null;
+let lineSeries = null;
+let predLineSeries = null;
+let backtestActualSeries = null;
+let backtestOnestepSeries = null;
+let backtestExtendedSeries = null;
+let backtestFtSeries = null;
+let backtestPropagatedFtSeries = null;
+let ftTrajectorySeries = null;
+let backtestData = null;
+let marketOpen = false;
+
+// ── Clock ──────────────────────────────────────────────────────
+function updateClock() {
+  const now = new Date();
+  const et = now.toLocaleTimeString('en-US', {timeZone: 'America/New_York', hour12: false});
+  document.getElementById('clock').textContent = et + ' ET';
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ── Toast notifications ────────────────────────────────────────
+function showToast(title, body, duration = 5000) {
+  const container = document.getElementById('toasts');
+  const toast = document.createElement('div');
+  toast.className = 'toast';
+  toast.innerHTML = `<div class="toast-title">${title}</div><div class="toast-body">${body}</div>`;
+  container.appendChild(toast);
+  setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, duration);
+}
+
+// ── Chart setup ────────────────────────────────────────────────
+function initChart() {
+  const container = document.getElementById('chartContainer');
+  chart = LightweightCharts.createChart(container, {
+    layout: {
+      background: { type: 'solid', color: '#0d1117' },
+      textColor: '#8b949e',
+      fontSize: 12,
+    },
+    grid: {
+      vertLines: { color: 'rgba(48,54,61,.4)' },
+      horzLines: { color: 'rgba(48,54,61,.4)' },
+    },
+    crosshair: {
+      mode: LightweightCharts.CrosshairMode.Normal,
+      vertLine: { color: 'rgba(88,166,255,.3)', width: 1, style: 0 },
+      horzLine: { color: 'rgba(88,166,255,.3)', width: 1, style: 0 },
+    },
+    rightPriceScale: {
+      borderColor: '#30363d',
+    },
+    timeScale: {
+      borderColor: '#30363d',
+      timeVisible: true,
+      secondsVisible: false,
+    },
+    handleScroll: true,
+    handleScale: true,
+  });
+
+  lineSeries = chart.addLineSeries({
+    color: '#58a6ff',
+    lineWidth: 2,
+    priceLineVisible: true,
+    lastValueVisible: true,
+    title: 'Actual',
+  });
+
+  predLineSeries = chart.addLineSeries({
+    color: '#bc8cff',
+    lineWidth: 2,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    priceLineVisible: false,
+    lastValueVisible: true,
+    title: 'VAR Predicted',
+    crosshairMarkerVisible: false,
+  });
+
+  backtestActualSeries = chart.addLineSeries({
+    color: '#8b949e',
+    lineWidth: 1.5,
+    priceLineVisible: false,
+    lastValueVisible: false,
+    title: 'Test Actual',
+    crosshairMarkerRadius: 4,
+  });
+
+  backtestOnestepSeries = chart.addLineSeries({
+    color: '#3fb950',
+    lineWidth: 1.5,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    priceLineVisible: false,
+    lastValueVisible: false,
+    title: '1-Step Pred',
+    crosshairMarkerRadius: 4,
+  });
+
+  backtestExtendedSeries = chart.addLineSeries({
+    color: '#d29922',
+    lineWidth: 2,
+    lineStyle: LightweightCharts.LineStyle.Dotted,
+    priceLineVisible: false,
+    lastValueVisible: false,
+    title: 'Next 10 days (pred)',
+    crosshairMarkerRadius: 4,
+  });
+
+  backtestFtSeries = chart.addLineSeries({
+    color: '#39d2c0',
+    lineWidth: 2,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    priceLineVisible: false,
+    lastValueVisible: false,
+    title: 'Factor Transformer',
+    crosshairMarkerRadius: 4,
+  });
+
+  backtestPropagatedFtSeries = chart.addLineSeries({
+    color: '#a371f7',
+    lineWidth: 2,
+    lineStyle: LightweightCharts.LineStyle.Dotted,
+    priceLineVisible: false,
+    lastValueVisible: false,
+    title: 'FT propagated (no true test)',
+    crosshairMarkerRadius: 4,
+  });
+
+  ftTrajectorySeries = chart.addLineSeries({
+    color: '#39d2c0',
+    lineWidth: 2,
+    lineStyle: LightweightCharts.LineStyle.Dotted,
+    priceLineVisible: false,
+    lastValueVisible: false,
+    title: 'FT Trajectory (live)',
+    crosshairMarkerRadius: 4,
+  });
+
+  new ResizeObserver(() => {
+    chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+  }).observe(container);
+}
+
+function updateChart() {
+  if (!selectedTicker || !chart) return;
+  const data = priceData[selectedTicker] || [];
+  lineSeries.setData(data);
+
+  // Backtest: actual, 1-step, FT, and extended (continues from FT) prediction
+  if (backtestData) {
+    const extHours = backtestData.extended_hours || 0;
+    const extLabel = extHours >= 168 ? 'Next 10 days' : (extHours >= 24 ? 'Next 24h' : 'Next hour');
+    const extTitle = extHours >= 168 ? 'Next 10 days (pred)' : (extHours >= 24 ? 'Next 24h (pred)' : 'Next hour (pred)');
+    const labelEl = document.getElementById('extendedPredLabel');
+    if (labelEl) labelEl.textContent = extLabel;
+    if (backtestExtendedSeries) backtestExtendedSeries.applyOptions({ title: extTitle });
+
+    const ts = backtestData.timestamps || [];
+    const actArr = (backtestData.actual || {})[selectedTicker];
+    const oneArr = (backtestData.onestep || {})[selectedTicker];
+    const ftArr = (backtestData.ft || {})[selectedTicker];
+    const extTs = backtestData.extended_timestamps || [];
+    const extArr = (backtestData.extended_ft || {})[selectedTicker];
+    const propTs = backtestData.propagated_ft_timestamps || [];
+    const propArr = (backtestData.propagated_ft || {})[selectedTicker];
+
+    const btActual = [], btOne = [], btFt = [], btExt = [], btProp = [];
+    for (let i = 0; i < ts.length; i++) {
+      if (!ts[i]) continue;
+      if (actArr && actArr[i] != null) btActual.push({ time: ts[i], value: actArr[i] });
+      if (oneArr && oneArr[i] != null) btOne.push({ time: ts[i], value: oneArr[i] });
+      if (ftArr && ftArr[i] != null) btFt.push({ time: ts[i], value: ftArr[i] });
+    }
+    for (let i = 0; i < extTs.length; i++) {
+      if (!extTs[i]) continue;
+      if (extArr && extArr[i] != null) btExt.push({ time: extTs[i], value: extArr[i] });
+    }
+    for (let i = 0; i < propTs.length; i++) {
+      if (!propTs[i]) continue;
+      if (propArr && propArr[i] != null) btProp.push({ time: propTs[i], value: propArr[i] });
+    }
+    backtestActualSeries.setData(btActual);
+    backtestOnestepSeries.setData(btOne);
+    backtestFtSeries.setData(btFt);
+    backtestExtendedSeries.setData(btExt);
+    backtestPropagatedFtSeries.setData(btProp);
+    if (btOne.length > 2) {
+      console.log('Backtest first 3 points for', selectedTicker);
+      for (let k = 0; k < 3; k++) {
+        console.log(`  t=${k}: actual=${btActual[k]?.value}, 1step=${btOne[k]?.value}, ft=${btFt[k]?.value}`);
+      }
+    }
+  } else {
+    backtestActualSeries.setData([]);
+    backtestOnestepSeries.setData([]);
+    backtestFtSeries.setData([]);
+    backtestExtendedSeries.setData([]);
+    if (backtestPropagatedFtSeries) backtestPropagatedFtSeries.setData([]);
+  }
+
+  // Accumulated live prediction points (1-min-ahead predictions over time)
+  const predPoints = livePredData[selectedTicker] || [];
+  predLineSeries.setData(predPoints);
+
+  // Factor Transformer live trajectory
+  if (activePrediction && activePrediction.ft_trajectory && activePrediction.ft_trajectory[selectedTicker]) {
+    const ftTraj = activePrediction.ft_trajectory[selectedTicker];
+    const ftTs = activePrediction.ft_timestamps_ms || [];
+    const ftPts = [];
+    const ftBase = activePrediction.base_prices ? activePrediction.base_prices[selectedTicker] : null;
+    if (ftBase != null && activePrediction.timestamp_ms) {
+      ftPts.push({ time: Math.floor(activePrediction.timestamp_ms / 1000), value: ftBase });
+    }
+    for (let h = 0; h < ftTraj.length; h++) {
+      const ts = ftTs[h] ? Math.floor(ftTs[h] / 1000) : null;
+      if (ts && ftTraj[h] != null) ftPts.push({ time: ts, value: ftTraj[h] });
+    }
+    ftTrajectorySeries.setData(ftPts);
+  } else {
+    ftTrajectorySeries.setData([]);
+  }
+
+  // Update header
+  const price = latestPrices[selectedTicker];
+  const prev = prevPrices[selectedTicker];
+  document.getElementById('chartTicker').textContent = selectedTicker;
+  if (price != null) {
+    document.getElementById('chartPrice').textContent = '$' + price.toFixed(2);
+    if (prev != null && prev !== 0) {
+      const chg = ((price - prev) / prev * 100);
+      const el = document.getElementById('chartChange');
+      el.textContent = (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%';
+      el.className = 'chart-change-big ' + (chg > 0 ? 'up' : chg < 0 ? 'down' : 'neutral');
+    }
+  }
+
+  // Prediction display: show next-minute predicted price
+  if (activePrediction && activePrediction.prices && activePrediction.prices[selectedTicker]) {
+    const pp = activePrediction.prices[selectedTicker];
+    const base = activePrediction.base_prices ? activePrediction.base_prices[selectedTicker] : (price || pp);
+    document.getElementById('chartPredPrice').textContent = '$' + pp.toFixed(2);
+    const dir = pp > base ? 'up' : pp < base ? 'down' : 'neutral';
+    const arrow = dir === 'up' ? ' ▲' : dir === 'down' ? ' ▼' : '';
+    const dirEl = document.getElementById('chartPredDir');
+    dirEl.textContent = arrow;
+    dirEl.className = 'value ' + dir;
+  } else {
+    document.getElementById('chartPredPrice').textContent = '--';
+    document.getElementById('chartPredDir').textContent = '';
+  }
+}
+
+// ── Ticker sidebar ─────────────────────────────────────────────
+function renderTickers(filter = '') {
+  const list = document.getElementById('tickerList');
+  const f = filter.toLowerCase();
+  const filtered = tickers.filter(t => t.toLowerCase().includes(f));
+  list.innerHTML = filtered.map(t => {
+    const price = latestPrices[t];
+    const prev = prevPrices[t];
+    const isActive = t === selectedTicker;
+    let changeStr = '--';
+    let changeClass = 'neutral';
+    if (price != null && prev != null && prev !== 0) {
+      const chg = (price - prev) / prev * 100;
+      changeStr = (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%';
+      changeClass = chg > 0 ? 'up' : chg < 0 ? 'down' : 'neutral';
+    }
+    let predArrow = '';
+    if (activePrediction && activePrediction.prices[t] && price != null) {
+      const pp = activePrediction.prices[t];
+      predArrow = pp > price ? '<span class="ticker-pred-arrow up">▲</span>'
+                : pp < price ? '<span class="ticker-pred-arrow down">▼</span>' : '';
+    }
+    return `<div class="ticker-item${isActive ? ' active' : ''}" data-ticker="${t}">
+      <div class="ticker-name">${t}${predArrow}</div>
+      <div class="ticker-price">${price != null ? '$'+price.toFixed(2) : '--'}</div>
+      <div class="ticker-change ${changeClass}">${changeStr}</div>
+    </div>`;
+  }).join('');
+
+  list.querySelectorAll('.ticker-item').forEach(el => {
+    el.addEventListener('click', () => {
+      selectedTicker = el.dataset.ticker;
+      renderTickers(document.getElementById('tickerSearch').value);
+      updateChart();
+    });
+  });
+}
+
+document.getElementById('tickerSearch').addEventListener('input', e => renderTickers(e.target.value));
+
+// ── Prediction history ─────────────────────────────────────────
+function renderPredHistory() {
+  const rows = document.getElementById('predRows');
+  let html = '';
+  const flat = [];
+  predictionHistory.forEach(entry => {
+    if (!entry.scores) return;
+    const time = new Date(entry.timestamp_ms).toLocaleTimeString('en-US', {
+      timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false
+    });
+    Object.entries(entry.scores).forEach(([ticker, s]) => {
+      flat.push({ time, ticker, ...s });
+    });
+  });
+  flat.slice(-50).reverse().forEach(r => {
+    const errClass = r.error_pct < 1 ? 'up' : r.error_pct < 3 ? 'neutral' : 'down';
+    html += `<div class="pred-row">
+      <div class="pred-time">${r.time}</div>
+      <div class="pred-ticker">${r.ticker}</div>
+      <div class="pred-price">$${r.predicted.toFixed(2)}</div>
+      <div class="pred-price">$${r.actual.toFixed(2)}</div>
+      <div class="pred-err ${errClass}">${r.error_pct.toFixed(1)}%</div>
+      <div class="pred-dir">${r.direction_correct ? '<span class="up">✓</span>' : '<span class="down">✗</span>'}</div>
+    </div>`;
+  });
+  rows.innerHTML = html || '<div style="padding:16px;color:var(--text-muted);font-size:12px;">No completed predictions yet. Predictions are scored each hour.</div>';
+
+  // Update live stats
+  if (flat.length > 0) {
+    document.getElementById('metricPreds').textContent = flat.length;
+    const avgErr = flat.reduce((s, r) => s + r.error_pct, 0) / flat.length;
+    document.getElementById('metricAvgErr').textContent = avgErr.toFixed(2) + '%';
+    const dirCorrect = flat.filter(r => r.direction_correct).length;
+    document.getElementById('metricDirAcc').textContent = Math.round(dirCorrect / flat.length * 100) + '%';
+  }
+}
+
+// ── Socket events ──────────────────────────────────────────────
+socket.on('connect', () => {
+  document.getElementById('connBadge').textContent = 'CONNECTED';
+  document.getElementById('connBadge').className = 'badge badge-connected';
+  fetch('/api/state').then(r => r.json()).then(data => {
+    tickers = data.tickers || [];
+    document.getElementById('tickerCount').textContent = tickers.length;
+    latestPrices = data.latest_prices || {};
+    prevPrices = { ...latestPrices };
+    activePrediction = data.active_prediction;
+    predictionHistory = data.prediction_history || [];
+    marketOpen = data.market_open;
+
+    // Initialize price data from history
+    (data.price_history || []).forEach(entry => {
+      const ts = Math.floor(entry.timestamp_ms / 1000);
+      Object.entries(entry.prices).forEach(([t, p]) => {
+        if (!priceData[t]) priceData[t] = [];
+        priceData[t].push({ time: ts, value: p });
+      });
+    });
+    // Deduplicate and sort
+    Object.keys(priceData).forEach(t => {
+      const seen = new Set();
+      priceData[t] = priceData[t].filter(d => {
+        if (seen.has(d.time)) return false;
+        seen.add(d.time);
+        return true;
+      }).sort((a, b) => a.time - b.time);
+    });
+
+    // Load backtest (held-out test slice results)
+    backtestData = data.backtest || null;
+
+    if (!selectedTicker && tickers.length > 0) selectedTicker = tickers[0];
+    renderTickers();
+    updateChart();
+    renderPredHistory();
+    updateStatusBadge(data.status);
+    updateMarketBadge(data.market_open);
+    if (data.train_info) updateTrainInfo(data.train_info);
+    if (data.status === 'ready') {
+      document.getElementById('overlay').classList.add('hidden');
+    }
+  });
+});
+
+socket.on('disconnect', () => {
+  document.getElementById('connBadge').textContent = 'DISCONNECTED';
+  document.getElementById('connBadge').className = 'badge badge-disconnected';
+});
+
+socket.on('status', data => {
+  updateStatusBadge(data.status);
+  if (data.tickers) {
+    tickers = data.tickers;
+    document.getElementById('tickerCount').textContent = tickers.length;
+    if (!selectedTicker && tickers.length > 0) selectedTicker = tickers[0];
+    renderTickers();
+  }
+  if (data.status === 'ready') {
+    document.getElementById('overlay').classList.add('hidden');
+  } else if (data.status === 'training') {
+    document.getElementById('overlay').classList.remove('hidden');
+    document.getElementById('overlayText').textContent = 'Training model on historical data...';
+  } else if (data.status === 'error') {
+    document.getElementById('overlay').classList.remove('hidden');
+    document.getElementById('overlayText').textContent = 'Error: ' + (data.error || 'Unknown');
+  }
+});
+
+socket.on('price_update', data => {
+  updateCount++;
+  document.getElementById('metricUpdates').textContent = updateCount;
+  const ts = Math.floor(data.timestamp_ms / 1000);
+  Object.entries(data.prices).forEach(([t, p]) => {
+    prevPrices[t] = latestPrices[t] || p;
+    latestPrices[t] = p;
+    if (!priceData[t]) priceData[t] = [];
+    const arr = priceData[t];
+    if (arr.length > 0 && arr[arr.length - 1].time === ts) {
+      arr[arr.length - 1].value = p;
+    } else {
+      arr.push({ time: ts, value: p });
+    }
+    // Keep last 480 points
+    if (arr.length > 480) priceData[t] = arr.slice(-480);
+  });
+  marketOpen = data.market_open;
+  updateMarketBadge(data.market_open);
+  renderTickers(document.getElementById('tickerSearch').value);
+  updateChart();
+});
+
+socket.on('new_prediction', data => {
+  activePrediction = data;
+  // Accumulate each 1-min prediction into livePredData
+  const ts = data.timestamps_ms ? Math.floor(data.timestamps_ms[0] / 1000) : Math.floor(data.target_ms / 1000);
+  Object.entries(data.prices).forEach(([t, p]) => {
+    if (!livePredData[t]) livePredData[t] = [];
+    const arr = livePredData[t];
+    if (arr.length === 0 || arr[arr.length - 1].time !== ts) {
+      arr.push({ time: ts, value: p });
+    }
+    if (arr.length > 480) livePredData[t] = arr.slice(-480);
+  });
+  renderTickers(document.getElementById('tickerSearch').value);
+  updateChart();
+});
+
+socket.on('prediction_scored', data => {
+  predictionHistory.push(data);
+  renderPredHistory();
+  const total = Object.keys(data.scores).length;
+  const correct = Object.values(data.scores).filter(s => s.direction_correct).length;
+  showToast('Prediction Scored', `Direction correct: ${correct}/${total} stocks`);
+});
+
+socket.on('train_info', data => {
+  updateTrainInfo(data);
+});
+
+socket.on('market_status', data => {
+  updateMarketBadge(data.open);
+});
+
+// ── Helpers ────────────────────────────────────────────────────
+function updateStatusBadge(status) {
+  const el = document.getElementById('statusBadge');
+  if (status === 'ready') { el.textContent = 'READY'; el.className = 'badge badge-ready'; }
+  else if (status === 'training') { el.textContent = 'TRAINING'; el.className = 'badge badge-training'; }
+  else if (status === 'error') { el.textContent = 'ERROR'; el.className = 'badge badge-error'; }
+  else { el.textContent = status.toUpperCase(); el.className = 'badge badge-training'; }
+}
+
+function updateMarketBadge(open) {
+  const el = document.getElementById('marketBadge');
+  if (open) { el.textContent = 'MARKET OPEN'; el.className = 'badge badge-market-open'; }
+  else { el.textContent = 'MARKET CLOSED'; el.className = 'badge badge-market-closed'; }
+}
+
+function updateTrainInfo(info) {
+  document.getElementById('metricStocks').textContent = info.n_tickers || '--';
+  const predLabel = document.getElementById('chartPredLabel');
+  if (predLabel) predLabel.textContent = (info.interval === '1h' ? 'Next hour:' : 'Next 1m:');
+  let lagStr = info.ar_order ? `AR(${info.ar_order})` : (info.lag || '--') + (info.interval === '1h' ? 'h' : 'min');
+  if (info.ft_window && info.ft_horizon) lagStr += ` | W=${info.ft_window} H=${info.ft_horizon}`;
+  if (info.ft_factors) lagStr += ` K=${info.ft_factors}`;
+  document.getElementById('metricLag').textContent = lagStr;
+  const bars = info.n_bars;
+  document.getElementById('metricBars').textContent = bars ? (bars > 1000 ? (bars/1000).toFixed(1)+'K' : bars) : '--';
+  const slices = info.n_slices;
+  document.getElementById('metricSlices').textContent = slices ? (slices > 1000 ? (slices/1000).toFixed(1)+'K' : slices) : '--';
+}
+
+document.getElementById('btnRetrain').addEventListener('click', () => {
+  if (confirm('Retrain model from cached data?')) {
+    fetch('/api/retrain', { method: 'POST' });
+    showToast('Retraining', 'Retraining from cached data...');
+  }
+});
+document.getElementById('btnFetchFresh').addEventListener('click', () => {
+  if (confirm('Re-download all historical data and retrain? This takes longer.')) {
+    fetch('/api/retrain?fresh=1', { method: 'POST' });
+    showToast('Fetching Fresh Data', 'Re-downloading historical data and retraining...');
+  }
+});
+
+// ── Init ───────────────────────────────────────────────────────
+initChart();
+</script>
+</body>
+</html>
