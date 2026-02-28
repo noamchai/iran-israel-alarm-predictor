@@ -501,7 +501,7 @@ INDEX_HTML = """<!DOCTYPE html>
     :root {
       --bg: #0a0a0f;
       --surface: #111118;
-      --card: #16161e;
+      --card: rgba(18,18,26,0.82);
       --card-border: rgba(255,255,255,0.07);
       --text: #e2e0dd;
       --muted: #666;
@@ -515,13 +515,26 @@ INDEX_HTML = """<!DOCTYPE html>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-      background: var(--bg);
+      background: url('/bg') center top / cover fixed no-repeat;
+      background-color: var(--bg);
       color: var(--text);
       min-height: 100vh;
     }
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.72);
+      z-index: 0;
+      pointer-events: none;
+    }
+    .header, .main-content, #nextAlarmBanner, .status-row, .section-header, .chart-card {
+      position: relative;
+      z-index: 1;
+    }
     /* Header */
     .header {
-      background: linear-gradient(rgba(0,0,0,0.62), rgba(0,0,0,0.78)), url('/bg') center/cover no-repeat;
+      background: linear-gradient(rgba(0,0,0,0.45), rgba(0,0,0,0.65));
       border-bottom: 1px solid rgba(255,60,60,0.25);
       padding: 1.5rem 2rem 1.25rem;
     }
