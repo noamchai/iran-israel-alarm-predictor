@@ -703,7 +703,7 @@ INDEX_HTML = """<!DOCTYPE html>
   <div class="header">
     <div class="header-inner">
       <h1>🇮🇱 ISRAEL VS. IRAN 🇮🇷 <span>ROUND 2</span></h1>
-      <div class="subtitle">AI-predicted P(rocket strike) in the next 5 / 15 / 60 minutes &mdash; from live Tzeva Adom data, refreshed every 5 minutes.</div>
+      <div class="subtitle">AI-predicted P(rocket strike) in the next 5 / 15 / 60 minutes &mdash; from live Tzeva Adom data, refreshed every ~3 minutes.</div>
     </div>
   </div>
 

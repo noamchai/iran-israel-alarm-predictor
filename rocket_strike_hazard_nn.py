@@ -197,9 +197,9 @@ def _fetch_github_alerts_minute(
                 for chunk in r.iter_content(chunk_size=65536):
                     f.write(chunk)
         elif max_rows is not None and GITHUB_ALERTS_CACHE.exists() and requests is not None:
-            # When using recent-only, refresh cache if older than 15 min so server gets latest data
+            # When using recent-only, refresh cache if older than 3 min so server gets latest data
             age_min = (datetime.now().timestamp() - GITHUB_ALERTS_CACHE.stat().st_mtime) / 60
-            if age_min > 15:
+            if age_min > 3:
                 print("     Fetching latest alerts from GitHub (cache was {:.0f} min old)...".format(age_min), flush=True)
                 r = requests.get(GITHUB_ALERTS_URL, timeout=60, stream=True)
                 r.raise_for_status()
