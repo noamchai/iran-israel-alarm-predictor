@@ -56,7 +56,7 @@ _state = {
     "error": None,
     "ready": False,
     "backtest_5h": None,     # {"times": [iso...], "actual": [0|1...], "pred": [float...]}
-    "next_15_probs": None,   # [p1, p2, ..., p15] for next 15 minutes
+    "next_15_probs": None,   # [p1, p2, ..., p60] per-minute probs for next 60 minutes
     "hawkes_params": None,   # (mu, alpha, beta) fitted Hawkes parameters
 }
 _lock = threading.Lock()
@@ -267,7 +267,7 @@ def _run_hawkes(df: pd.DataFrame) -> dict:
         15:   cumulative[14],
         60:   cumulative[59],
     }
-    next_15 = per_min[:15]
+    next_15 = per_min[:60]   # send all 60 min so chart extends to match the 60-min card
 
     # ---- backtest: Hawkes intensity over last 5 h ----------------------------
     n_5h     = 5 * 60
@@ -828,11 +828,12 @@ INDEX_HTML = """<!DOCTYPE html>
                                    .concat(futureTimes.map(function() { return null; }));
 
         // Dataset 2: cumulative P(next strike has happened BY minute k after now)
-        // Starts at 0 right after "now", rises to the 15-min card value by +15m
-        var cumFore = [], cprod2 = 1.0;
+        // Hawkes per_min are NOT independent: cumulative[k] = sum(per_min[0..k])
+        // (telescoping survival function: S(0)-S(k) = sum of S(i-1)-S(i))
+        var cumFore = [], cumSum = 0.0;
         for (var i = 0; i < probs15.length; i++) {
-          cprod2 *= Math.max(0, 1 - probs15[i]);
-          cumFore.push(1 - cprod2);
+          cumSum = Math.min(1.0, cumSum + probs15[i]);
+          cumFore.push(cumSum);
         }
         var cdfData = histTimes.map(function() { return null; }).concat(cumFore);
 
