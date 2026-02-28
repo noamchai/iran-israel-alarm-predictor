@@ -158,31 +158,79 @@ def _parse_github_alerts(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     return daily[["date", "strike", "strike_count"]]
 
 
+def _read_csv_tail(path: Path, max_rows: int, encoding: str = "utf-8") -> Optional[pd.DataFrame]:
+    """Read only the last max_rows data rows from a CSV (keeps header). Use for low-memory recent-only load."""
+    if not path.exists():
+        return None
+    try:
+        with open(path, encoding=encoding) as f:
+            f.readline()  # header
+            n = sum(1 for _ in f)
+        skip = max(0, n - max_rows)
+        return pd.read_csv(path, encoding=encoding, skiprows=range(1, skip + 1), nrows=max_rows)
+    except Exception:
+        return None
+
+
 def _fetch_github_alerts_minute(
     force_refresh: bool = False,
     max_cache_age_minutes: Optional[float] = 60,
+    max_rows: Optional[int] = None,
 ) -> Optional[pd.DataFrame]:
     """Fetch GitHub alerts and return minute-level timeline [datetime, strike, strike_count].
-    If force_refresh or cache older than max_cache_age_minutes, re-downloads so the last hour has fresh data."""
+    If max_rows is set, only the last max_rows CSV rows are read (low memory, recent data only)."""
     if requests is None and not GITHUB_ALERTS_CACHE.exists():
         return None
     try:
-        should_fetch = force_refresh
-        if not should_fetch and GITHUB_ALERTS_CACHE.exists() and max_cache_age_minutes is not None:
+        should_fetch = force_refresh and max_rows is None  # don't re-fetch when we only want tail
+        if not should_fetch and GITHUB_ALERTS_CACHE.exists() and max_cache_age_minutes is not None and max_rows is None:
             age_min = (datetime.now().timestamp() - GITHUB_ALERTS_CACHE.stat().st_mtime) / 60
             if age_min > max_cache_age_minutes:
                 should_fetch = True
-        if should_fetch and requests is not None:
-            print("     Re-fetching GitHub alerts (cache stale or --refresh) for fresh last hour...", flush=True)
+        if not GITHUB_ALERTS_CACHE.exists() and requests is not None:
+            # Stream to file to avoid OOM when we only need tail
+            print("     Fetching GitHub alerts (streaming)...", flush=True)
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            r = requests.get(GITHUB_ALERTS_URL, timeout=60, stream=True)
+            r.raise_for_status()
+            with open(GITHUB_ALERTS_CACHE, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    f.write(chunk)
+        elif max_rows is not None and GITHUB_ALERTS_CACHE.exists() and requests is not None:
+            # When using recent-only, refresh cache if older than 15 min so server gets latest data
+            age_min = (datetime.now().timestamp() - GITHUB_ALERTS_CACHE.stat().st_mtime) / 60
+            if age_min > 15:
+                print("     Fetching latest alerts from GitHub (cache was {:.0f} min old)...".format(age_min), flush=True)
+                r = requests.get(GITHUB_ALERTS_URL, timeout=60, stream=True)
+                r.raise_for_status()
+                with open(GITHUB_ALERTS_CACHE, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        f.write(chunk)
+            else:
+                print("     Using cached alerts ({:.0f} min old).".format(age_min), flush=True)
+        if should_fetch and requests is not None and (max_rows is None or not GITHUB_ALERTS_CACHE.exists()):
+            print("     Re-fetching GitHub alerts (cache stale or --refresh)...", flush=True)
             r = requests.get(GITHUB_ALERTS_URL, timeout=30)
             r.raise_for_status()
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             GITHUB_ALERTS_CACHE.write_text(r.text, encoding="utf-8")
         if GITHUB_ALERTS_CACHE.exists():
-            df = pd.read_csv(GITHUB_ALERTS_CACHE, nrows=500000)
+            if max_rows is not None:
+                df = _read_csv_tail(GITHUB_ALERTS_CACHE, max_rows)
+            else:
+                df = pd.read_csv(GITHUB_ALERTS_CACHE, nrows=500000)
         else:
             return None
+        if df is None or df.empty:
+            return None
     except Exception:
+        return None
+    return _minute_timeline_from_parsed_df(df)
+
+
+def _minute_timeline_from_parsed_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """Build minute-level timeline from a parsed alerts DataFrame with _dt or date+time."""
+    if df.empty:
         return None
     date_col = None
     for c in df.columns:
@@ -198,6 +246,8 @@ def _fetch_github_alerts_minute(
     df = df.dropna(subset=["_dt"])
     if df.empty:
         return None
+    # Ensure chronological order (tail might be read from end of file; sort so start/end are min/max date)
+    df = df.sort_values("_dt").reset_index(drop=True)
     df["_minute"] = df["_dt"].dt.floor("min")
     minute_counts = df.groupby("_minute", as_index=False).size()
     minute_counts.columns = ["datetime", "strike_count"]
@@ -495,17 +545,21 @@ def build_minute_timeline(
     end: Optional[pd.Timestamp] = None,
     use_kaggle: bool = True,
     force_refresh: bool = False,
+    max_rows: Optional[int] = None,
 ) -> Optional[pd.DataFrame]:
     """
     Build a continuous per-minute timeline. Tries GitHub (dleshem) first, then Kaggle.
-    If force_refresh=True, re-downloads GitHub cache so the last hour has fresh data.
+    If max_rows is set, only the last max_rows CSV rows are loaded (low memory, for live-update servers).
     Returns None if no minute-level data available.
     """
     import sys
     print("     Loading/parsing minute data...", flush=True)
-    minute_df = _fetch_github_alerts_minute(force_refresh=force_refresh)
+    minute_df = _fetch_github_alerts_minute(force_refresh=force_refresh, max_rows=max_rows)
     if minute_df is None or len(minute_df) < 1000:
-        minute_df = load_kaggle_tzeva_adom_minute()
+        if max_rows is None:
+            minute_df = load_kaggle_tzeva_adom_minute()
+        else:
+            minute_df = None
     if minute_df is None or len(minute_df) == 0:
         return None
     end = end or pd.Timestamp(datetime.now()).floor("min")
@@ -526,6 +580,14 @@ def build_minute_timeline(
             minute_df.loc[mask, "strike"] = 1
             minute_df.loc[mask, "strike_count"] = np.maximum(minute_df.loc[mask, "strike_count"].values, 1)
             print(f"     Merged {mask.sum()} strike minute(s) from today (Oref) into timeline.", flush=True)
+    # When using recent-only (max_rows), keep only last 7 days + 5h so timeline is recent and model sees current context
+    if max_rows is not None:
+        max_minutes = 7 * 24 * 60 + 300
+        if len(minute_df) > max_minutes:
+            minute_df = minute_df.iloc[-max_minutes:].reset_index(drop=True)
+            print(f"     Kept last {max_minutes} minutes for recent-only mode.", flush=True)
+    t0, t1 = minute_df["datetime"].min(), minute_df["datetime"].max()
+    print("     Timeline: {} to {} (through now).".format(t0.strftime("%Y-%m-%d %H:%M"), t1.strftime("%Y-%m-%d %H:%M")), flush=True)
     return minute_df
 
 
@@ -834,7 +896,10 @@ def train_hazard_nn(
 
 def predict_proba_strike(model, scaler, X: np.ndarray) -> np.ndarray:
     """Predict P(strike in next period) for each row. Returns (n_samples,) proba of class 1."""
-    X_sc = scaler.transform(np.asarray(X))
+    X = np.asarray(X, dtype=float)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    X_sc = scaler.transform(X)
+    X_sc = np.nan_to_num(X_sc, nan=0.0, posinf=0.0, neginf=0.0)
     return model.predict_proba(X_sc)[:, 1]
 
 

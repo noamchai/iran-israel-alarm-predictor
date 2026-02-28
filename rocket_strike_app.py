@@ -10,6 +10,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
@@ -25,7 +26,6 @@ _env_tqdm = os.environ.get("TQDM_DISABLE")
 os.environ["TQDM_DISABLE"] = "1"
 
 from rocket_strike_hazard_nn import (
-    MAX_MINUTE_ROWS,
     FEATURE_COLS_MINUTE,
     build_minute_timeline,
     hazard_features_minute,
@@ -57,6 +57,67 @@ _state = {
     "next_15_probs": None,   # [p1, p2, ..., p15] for next 15 minutes
 }
 _lock = threading.Lock()
+
+# Use fewer rows on low-memory hosts (e.g. Render free tier 512MB). Set MAX_MINUTE_ROWS=500000 locally for full data.
+MAX_MINUTE_ROWS = int(os.environ.get("MAX_MINUTE_ROWS", "80000"))
+
+# Static state: train locally, export live_state.json, then deploy with USE_STATIC_STATE=1 to only serve graphs (no training on server)
+CACHE_DIR = _PROJECT_ROOT / "data_cache"
+LIVE_STATE_FILE = CACHE_DIR / "live_state.json"
+# Pretrained model: train locally, save with joblib; server loads it and only fetches recent data to update probs/graphs
+MODEL_FILE = CACHE_DIR / "model.joblib"
+# When we loaded a pretrained model, refresh uses only last N CSV rows (low memory)
+_REFRESH_MAX_ROWS = None
+
+try:
+    import joblib
+except ImportError:
+    joblib = None
+
+
+def _load_pretrained_model() -> bool:
+    """Load model and scaler from MODEL_FILE. Returns True if loaded. Server then uses recent-only data to update probs."""
+    if joblib is None or not MODEL_FILE.exists():
+        return False
+    try:
+        obj = joblib.load(MODEL_FILE)
+        if isinstance(obj, (list, tuple)) and len(obj) >= 2:
+            model, scaler = obj[0], obj[1]
+        else:
+            return False
+        with _lock:
+            _state["model"] = model
+            _state["scaler"] = scaler
+        return True
+    except Exception:
+        return False
+
+
+def _load_static_state() -> bool:
+    """Load pre-computed state from live_state.json. Returns True if loaded."""
+    import json
+    if not LIVE_STATE_FILE.exists():
+        return False
+    try:
+        with open(LIVE_STATE_FILE) as f:
+            data = json.load(f)
+        with _lock:
+            _state["probs"] = {
+                "1": data["probs"]["1"],
+                5: data["probs"]["5"],
+                15: data["probs"]["15"],
+                60: data["probs"]["60"],
+            }
+            _state["backtest_5h"] = data.get("backtest_5h")
+            _state["next_15_probs"] = data.get("next_15_probs")
+            _state["updated_at"] = data.get("updated_at", "")
+            _state["ready"] = True
+            _state["error"] = None
+        return True
+    except Exception as e:
+        with _lock:
+            _state["error"] = str(e)
+        return False
 
 
 def _compute_backtest_and_next_15(df, model, scaler):
@@ -128,18 +189,20 @@ def _train_and_predict():
             _state["ready"] = False
 
 
-def _refresh_data_only():
-    """Re-fetch timeline and features, recompute probs with existing model (no retrain)."""
+def _refresh_data_only(max_rows: Optional[int] = None):
+    """Re-fetch timeline and features, recompute probs with existing model (no retrain).
+    When max_rows is set, only last max_rows CSV rows are loaded (low memory, live update)."""
     with _lock:
         model, scaler = _state.get("model"), _state.get("scaler")
+        use_recent = max_rows if max_rows is not None else _REFRESH_MAX_ROWS
     if model is None or scaler is None:
         _train_and_predict()
         return
     try:
-        timeline = build_minute_timeline()
+        timeline = build_minute_timeline(max_rows=use_recent)
         if timeline is None or len(timeline) < 100:
             return
-        if len(timeline) > MAX_MINUTE_ROWS:
+        if use_recent is None and len(timeline) > MAX_MINUTE_ROWS:
             timeline = timeline.iloc[-MAX_MINUTE_ROWS:].reset_index(drop=True)
         df = hazard_features_minute(timeline)
         last_idx = len(df) - 1
@@ -155,16 +218,17 @@ def _refresh_data_only():
             _state["backtest_5h"] = backtest_5h
             _state["next_15_probs"] = next_15_probs
             _state["error"] = None
+            _state["ready"] = True
     except Exception as e:
         with _lock:
             _state["error"] = str(e)
 
 
-def _background_refresh():
-    """Run data refresh every 5 minutes."""
+def _background_refresh(max_rows: Optional[int] = None):
+    """Run data refresh every 5 minutes. When max_rows set, use recent-only fetch (for pretrained model)."""
     while True:
         time.sleep(300)  # 5 minutes
-        _refresh_data_only()
+        _refresh_data_only(max_rows=max_rows)
 
 
 def create_app():
@@ -182,7 +246,7 @@ def create_app():
             if not _state["ready"]:
                 return jsonify({
                     "ok": False,
-                    "error": _state.get("error") or "Model not ready yet. Wait for first training.",
+                    "error": _state.get("error") or "No model yet. Run: python export_live_state.py then add data_cache/model.joblib to the project.",
                     "updated_at": _state.get("updated_at"),
                 }), 503
             out = {
@@ -196,8 +260,7 @@ def create_app():
             }
             if _state.get("backtest_5h"):
                 out["backtest_5h"] = _state["backtest_5h"]
-            if _state.get("next_15_probs"):
-                out["next_15_probs"] = _state["next_15_probs"]
+            out["next_15_probs"] = _state.get("next_15_probs") or []
             return jsonify(out)
 
     return app
@@ -277,7 +340,8 @@ INDEX_HTML = """<!DOCTYPE html>
     function updateCharts(data) {
       if (data.backtest_5h && data.backtest_5h.times && data.backtest_5h.times.length) {
         var times = data.backtest_5h.times;
-        var step = Math.max(1, Math.floor(times.length / 6));
+        var labelEveryMinutes = 30;
+        var step = Math.max(1, labelEveryMinutes);
         var labels = times.map(function(_, i) {
           return (i % step === 0 || i === times.length - 1) ? formatTime(times[i]) : '';
         });
@@ -309,7 +373,7 @@ INDEX_HTML = """<!DOCTYPE html>
       if (probs15 && Array.isArray(probs15) && probs15.length > 0) {
         var values = probs15.map(Number);
         var maxP = Math.max.apply(null, values);
-        var yMax = Math.max(0.1, maxP * 1.2);
+        var yMax = Math.max(0.01, maxP * 1.2);
         if (chartNext15) chartNext15.destroy();
         chartNext15 = new Chart(document.getElementById('chartNext15'), {
           type: 'bar',
@@ -363,15 +427,37 @@ INDEX_HTML = """<!DOCTYPE html>
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5050"))
-    # One-time train on startup (then background only refreshes data every 5 min)
-    print("Rocket strike web app – loading data and training model (may take a minute)...", flush=True)
-    _train_and_predict()
-    if not _state["ready"]:
-        print("Warning: model not ready.", _state.get("error"), flush=True)
+    use_static = os.environ.get("USE_STATIC_STATE", "").strip().lower() in ("1", "true", "yes")
+    if use_static and LIVE_STATE_FILE.exists():
+        print("Rocket strike web app – loading pre-computed state (no training)...", flush=True)
+        if _load_static_state():
+            print("  Loaded live_state.json. Serving graphs only.", flush=True)
+        else:
+            print("  Failed to load live_state.json.", _state.get("error"), flush=True)
+    elif MODEL_FILE.exists() and joblib is not None:
+        # Load pretrained model; fetch recent data only and update live every 5 min
+        _REFRESH_MAX_ROWS = 120000  # last ~120k CSV rows = enough for 7d context, fits 512MB
+        print("Rocket strike web app – loading pretrained model (no training)...", flush=True)
+        if _load_pretrained_model():
+            print("  Model loaded. Fetching recent data and updating every 5 min.", flush=True)
+            _refresh_data_only(max_rows=_REFRESH_MAX_ROWS)
+            t = threading.Thread(target=_background_refresh, daemon=True, kwargs={"max_rows": _REFRESH_MAX_ROWS})
+            t.start()
+        else:
+            print("  Failed to load model. Falling back to training.", flush=True)
+            _train_and_predict()
+            if _state["ready"]:
+                t = threading.Thread(target=_background_refresh, daemon=True)
+                t.start()
     else:
-        print("Model ready. Starting server and 5-minute data refresh.", flush=True)
-    t = threading.Thread(target=_background_refresh, daemon=True)
-    t.start()
+        print("Rocket strike web app – loading data and training model (may take a minute)...", flush=True)
+        _train_and_predict()
+        if not _state["ready"]:
+            print("Warning: model not ready.", _state.get("error"), flush=True)
+        else:
+            print("Model ready. Starting server and 5-minute data refresh.", flush=True)
+        t = threading.Thread(target=_background_refresh, daemon=True)
+        t.start()
     app = create_app()
     print(f"  Open http://127.0.0.1:{port}", flush=True)
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
