@@ -160,9 +160,11 @@ def _extend_backtest_to_now(backtest_5h: dict) -> dict:
 def _load_all_strike_times_minutes() -> list:
     """Load historical strike times (minutes from epoch) from the alerts CSV.
 
-    Filters to conflict-active days only (days with >= 5 strikes) so that Hawkes
-    parameters (especially μ) are calibrated to conflict intensity rather than
-    diluted by quiet peacetime periods.
+    Adaptive window strategy:
+      1. If the last 7 days have >= 30 unique strike-minutes → use ONLY those 7 days.
+         This captures the current escalation rate and gives accurate absolute probabilities.
+      2. Otherwise fall back to all conflict-active days (days with >= 5 strikes).
+         This avoids quiet peacetime periods diluting the parameters.
     Used for Hawkes parameter fitting only (not for current intensity).
     """
     from rocket_strike_hazard_nn import GITHUB_ALERTS_CACHE
@@ -185,20 +187,29 @@ def _load_all_strike_times_minutes() -> list:
             return []
         # Parse as UTC
         ts = pd.to_datetime(raw[date_col], errors="coerce", utc=True).dropna()
-        # Build a DataFrame with date (UTC) to count strikes per day
+        epoch = pd.Timestamp("1970-01-01", tz="UTC")
+
+        # --- Strategy 1: recent episode (last 7 days) ---
+        recent_cutoff = ts.max() - pd.Timedelta(days=7)
+        ts_recent = ts[ts >= recent_cutoff].dt.floor("min").drop_duplicates().sort_values()
+        if len(ts_recent) >= 30:
+            minutes = [(t - epoch).total_seconds() / 60.0 for t in ts_recent]
+            print(f"  Hawkes training: {len(minutes):,} strike-minutes from last 7 days "
+                  f"(current episode, {ts_recent.min().date()} → {ts_recent.max().date()})",
+                  flush=True)
+            return minutes
+
+        # --- Strategy 2: all conflict-active days (>= 5 raw alerts/day) ---
         df_ts = pd.DataFrame({"ts": ts})
         df_ts["date"] = df_ts["ts"].dt.date
         daily_counts = df_ts.groupby("date").size()
-        # Keep only conflict-active days (>= 5 raw alerts per day)
         active_dates = set(daily_counts[daily_counts >= 5].index)
         df_ts = df_ts[df_ts["date"].isin(active_dates)]
-        # Deduplicate to minute-level within active days
         ts_min = df_ts["ts"].dt.floor("min").drop_duplicates().sort_values()
-        epoch = pd.Timestamp("1970-01-01", tz="UTC")
         minutes = [(t - epoch).total_seconds() / 60.0 for t in ts_min]
         print(f"  Hawkes training: {len(minutes):,} strike-minutes on "
               f"{len(active_dates)} conflict-active days "
-              f"({ts_min.min().date()} → {ts_min.max().date()})", flush=True)
+              f"({ts_min.min().date()} → {ts_min.max().date()}) [fallback]", flush=True)
         return minutes
     except Exception as e:
         print(f"  Warning: could not load full alert history for Hawkes: {e}", flush=True)
