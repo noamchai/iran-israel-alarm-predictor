@@ -185,6 +185,10 @@ def _load_all_strike_times_minutes() -> list:
                     break
         if date_col is None:
             return []
+        # Filter to actual attack alerts only (matrix_id 1=rockets, 6=drones)
+        # Exclude informational: flash, update, prepare-warning, all-clear (matrix_id 10, etc.)
+        if "matrix_id" in raw.columns:
+            raw = raw[raw["matrix_id"].isin([1, 6])]
         # Parse as UTC
         ts = pd.to_datetime(raw[date_col], errors="coerce", utc=True).dropna()
         epoch = pd.Timestamp("1970-01-01", tz="UTC")

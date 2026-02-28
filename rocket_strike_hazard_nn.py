@@ -232,6 +232,14 @@ def _minute_timeline_from_parsed_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """Build minute-level timeline from a parsed alerts DataFrame with _dt or date+time."""
     if df.empty:
         return None
+    # Filter to actual attack alerts only:
+    #   matrix_id 1 = rocket/missile fire (ירי רקטות וטילים)
+    #   matrix_id 6 = hostile aircraft/drones (חדירת כלי טיס עוין)
+    # Exclude informational (matrix_id 10): flash, update, prepare-warning, all-clear, event-ended
+    if "matrix_id" in df.columns:
+        df = df[df["matrix_id"].isin([1, 6])].copy()
+        if df.empty:
+            return None
     date_col = None
     for c in df.columns:
         if str(c).strip().lower() in ("alertdate", "alert_date", "datetime"):
