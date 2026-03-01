@@ -554,15 +554,17 @@ def create_app():
             probs15 = _state.get("next_15_probs") or []
             out["next_15_probs"] = probs15
             # Compute first minute where cumulative P(≥1 strike) crosses 50%
+            # Use simple sum = correct Hawkes cumulative (per_min[k] = survival(k-1)-survival(k),
+            # so sum(per_min[0..k]) = 1 - survival(k+1) = cumulative[k]).
+            # NOT the independent-Bernoulli formula 1-prod(1-p), which underestimates Hawkes.
             if probs15:
-                cum, prod = 0.0, 1.0
+                cum = 0.0
                 next_alarm_min = None
                 for k, p in enumerate(probs15, start=1):
-                    prod *= max(0.0, 1.0 - p)
-                    cum = 1.0 - prod
+                    cum = min(1.0, cum + p)
                     if cum >= 0.50 and next_alarm_min is None:
                         next_alarm_min = k
-                out["next_alarm_min"] = next_alarm_min  # None if <50% in 15 min
+                out["next_alarm_min"] = next_alarm_min  # None if <50% in 60 min
             return jsonify(out)
 
     return app
@@ -866,13 +868,8 @@ INDEX_HTML = """<!DOCTYPE html>
         var times = data.backtest_5h.times;
         var actData = (data.backtest_5h.actual || []).map(Number);
 
-        // Trim to start 30 min before the first strike (skip empty early-morning)
-        // With 24h of data, bars become <1px wide and invisible unless we trim
-        var firstStrikeIdx = 0;
-        for (var fi = 0; fi < actData.length; fi++) {
-          if (actData[fi] === 1) { firstStrikeIdx = fi; break; }
-        }
-        var trimStart = Math.max(0, firstStrikeIdx - 30);
+        // Always show the last 8 hours (480 minutes) of history for a stable, predictable window.
+        var trimStart = Math.max(0, times.length - 480);
         var histTimes  = times.slice(trimStart);
         var histActual = actData.slice(trimStart);
 
@@ -986,11 +983,12 @@ INDEX_HTML = """<!DOCTYPE html>
 
       // --- Next 15 min chart: per-minute bars + cumulative line ---
       if (probs15.length > 0) {
-        // Cumulative: P(at least one strike by minute k) = 1 - product(1-p[0..k])
-        var cumulative = [], prod = 1.0;
+        // Cumulative: simple sum = correct Hawkes formula (per_min[k] = survival(k-1)-survival(k),
+        // so sum[0..k] = 1 - survival(k+1) = cumulative[k], matching the displayed cards).
+        var cumulative = [], cumS = 0.0;
         for (var i = 0; i < probs15.length; i++) {
-          prod *= Math.max(0, 1 - probs15[i]);
-          cumulative.push(1 - prod);
+          cumS = Math.min(1.0, cumS + probs15[i]);
+          cumulative.push(cumS);
         }
         var maxBar = Math.max.apply(null, probs15);
         var yMax = Math.max(0.05, Math.max(maxBar, cumulative[cumulative.length-1]) * 1.05);
@@ -1092,7 +1090,7 @@ INDEX_HTML = """<!DOCTYPE html>
         var alarmTime = new Date(new Date().getTime() + alarmMin * 60000);
         var hh = alarmTime.getHours().toString().padStart(2,'0');
         var mm = alarmTime.getMinutes().toString().padStart(2,'0');
-        banner.textContent = '⚠ 50% chance of next strike reached at +' + alarmMin + ' min  (' + hh + ':' + mm + ' local)';
+        banner.textContent = '⚠ High probability of next strike at +' + alarmMin + ' min  (' + hh + ':' + mm + ' local)';
         banner.style.display = 'block';
       } else {
         banner.style.display = 'none';
