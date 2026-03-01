@@ -177,42 +177,45 @@ def _read_csv_tail(path: Path, max_rows: int, encoding: str = "utf-8") -> Option
 TZEVAADOM_HISTORY_URL = "https://api.tzevaadom.co.il/alerts-history"
 
 
-def _fetch_oref_history_strike_minutes() -> set:
-    """Fetch AlertsHistory.json from Oref and return set of minute-floored timestamps
-    for rocket alerts (matrix_id=1). Returns empty set on failure (geo-restricted / network error).
+def _fetch_oref_history_strike_minutes() -> tuple:
+    """Fetch AlertsHistory.json from Oref and return (strike_minutes, prepare_minutes).
+    strike_minutes: matrix_id=1 (rockets). prepare_minutes: matrix_id=10 ("coming minutes" prepare alerts).
+    Returns empty sets on failure (geo-restricted / network error).
     This endpoint is updated within seconds of an alert — far more current than the GitHub CSV.
     Only works from Israeli IPs; use _fetch_tzevaadom_strike_minutes() as global fallback."""
     if requests is None:
-        return set()
+        return set(), set()
     try:
         r = requests.get(OREF_HISTORY_URL, headers=OREF_HEADERS, timeout=10)
         r.raise_for_status()
         data = r.json()
     except Exception:
-        return set()
+        return set(), set()
     if not isinstance(data, list):
-        return set()
-    minutes = set()
+        return set(), set()
+    strike_minutes = set()
+    prepare_minutes = set()
     for alert in data:
         if not isinstance(alert, dict):
             continue
-        # Filter to rockets only (matrix_id=1); if field missing, include the alert
         mid = alert.get("matrix_id") or alert.get("category")
-        if mid is not None:
-            try:
-                if int(mid) != 1:
-                    continue
-            except (TypeError, ValueError):
-                pass
+        try:
+            mid_int = int(mid) if mid is not None else None
+        except (TypeError, ValueError):
+            mid_int = None
         for key in ("alertDate", "alert_date", "alertdate", "datetime", "date"):
             val = alert.get(key)
             if val:
                 try:
-                    minutes.add(pd.to_datetime(val).floor("min"))
+                    ts = pd.to_datetime(val).floor("min")
+                    if mid_int == 10:
+                        prepare_minutes.add(ts)
+                    elif mid_int == 1 or mid_int is None:
+                        strike_minutes.add(ts)
                     break
                 except Exception:
                     pass
-    return minutes
+    return strike_minutes, prepare_minutes
 
 
 _ISRAEL_TZ_OFFSET = pd.Timedelta(hours=2)  # Israel = UTC+2 (winter); timeline datetimes are Israeli local (tz-naive)
@@ -230,22 +233,24 @@ def _now_israeli_time() -> pd.Timestamp:
         return pd.Timestamp.utcnow() + _ISRAEL_TZ_OFFSET
 
 
-def _fetch_tzevaadom_strike_minutes() -> set:
+def _fetch_tzevaadom_strike_minutes() -> tuple:
     """Fetch recent alerts from api.tzevaadom.co.il/alerts-history (globally accessible, no geo-restriction).
-    Returns set of minute-floored ISRAELI-TIME (tz-naive) timestamps for non-drill alerts.
+    Returns (strike_minutes, prepare_minutes) — sets of minute-floored ISRAELI-TIME (tz-naive) timestamps.
     Response: list of {id, alerts: [{time (unix/UTC), cities, threat, isDrill}]}
-    Converts UTC → Israeli local time to match the GitHub CSV timeline timezone."""
+    threat=10 (or "10") identifies prepare alerts ("בדקות הקרובות"); all others are rocket strikes.
+    Converts UTC unix → Israeli local time to match the GitHub CSV timeline timezone."""
     if requests is None:
-        return set()
+        return set(), set()
     try:
         r = requests.get(TZEVAADOM_HISTORY_URL, timeout=10)
         r.raise_for_status()
         data = r.json()
     except Exception:
-        return set()
+        return set(), set()
     if not isinstance(data, list):
-        return set()
-    minutes = set()
+        return set(), set()
+    strike_minutes = set()
+    prepare_minutes = set()
     for group in data:
         if not isinstance(group, dict):
             continue
@@ -255,14 +260,23 @@ def _fetch_tzevaadom_strike_minutes() -> set:
             if alert.get("isDrill", False):
                 continue
             ts = alert.get("time")
-            if ts is not None:
-                try:
-                    # Convert UTC unix → Israeli local time (tz-naive, matching GitHub CSV)
-                    il_time = (pd.Timestamp(int(ts), unit="s") + _ISRAEL_TZ_OFFSET).floor("min")
-                    minutes.add(il_time)
-                except Exception:
-                    pass
-    return minutes
+            if ts is None:
+                continue
+            try:
+                il_time = (pd.Timestamp(int(ts), unit="s") + _ISRAEL_TZ_OFFSET).floor("min")
+            except Exception:
+                continue
+            # Detect prepare alerts by threat type (matrix_id=10 equivalent in tzevaadom)
+            threat = alert.get("threat")
+            try:
+                is_prepare = int(threat) == 10
+            except (TypeError, ValueError):
+                is_prepare = str(threat) in ("10", "prepare", "preparatory") or "בדקות" in str(threat or "")
+            if is_prepare:
+                prepare_minutes.add(il_time)
+            else:
+                strike_minutes.add(il_time)
+    return strike_minutes, prepare_minutes
 
 
 def _supplement_with_oref_history(timeline: pd.DataFrame) -> pd.DataFrame:
@@ -277,30 +291,32 @@ def _supplement_with_oref_history(timeline: pd.DataFrame) -> pd.DataFrame:
         return timeline
 
     # Try Oref first (Israeli IPs); fall back to tzevaadom (global)
-    gap_minutes = _fetch_oref_history_strike_minutes()
+    strike_minutes, prepare_minutes = _fetch_oref_history_strike_minutes()
     source = "Oref"
-    if not gap_minutes:
-        gap_minutes = _fetch_tzevaadom_strike_minutes()
+    if not strike_minutes and not prepare_minutes:
+        strike_minutes, prepare_minutes = _fetch_tzevaadom_strike_minutes()
         source = "tzevaadom"
-    if not gap_minutes:
-        return timeline
 
-    # Keep only minutes strictly inside the gap (after last GitHub row, up to now)
-    strike_in_gap = {m for m in gap_minutes if last_ts < m <= now_floor}
-
-    # Build a full minute range for the gap, marking strikes
     gap_range = pd.date_range(start=last_ts + pd.Timedelta(minutes=1), end=now_floor, freq="min")
     if len(gap_range) == 0:
         return timeline
+
+    # Keep only minutes strictly inside the gap (after last GitHub row, up to now)
+    strike_in_gap  = {m for m in strike_minutes  if last_ts < m <= now_floor}
+    prepare_in_gap = {m for m in prepare_minutes if last_ts < m <= now_floor}
+
+    # Build a full minute range for the gap, marking strikes and prepare alerts
     gap_df = pd.DataFrame({"datetime": gap_range})
     gap_df["strike"] = gap_df["datetime"].isin(strike_in_gap).astype(int)
     gap_df["strike_count"] = gap_df["strike"]
     if "prepare_alert" in timeline.columns:
-        gap_df["prepare_alert"] = 0
+        gap_df["prepare_alert"] = gap_df["datetime"].isin(prepare_in_gap).astype(int)
 
-    n_strikes = int(gap_df["strike"].sum())
-    if n_strikes > 0:
-        print(f"  {source} history supplement: {n_strikes} strike minute(s) in {len(gap_range)}-min gap after GitHub CSV.", flush=True)
+    n_strikes  = int(gap_df["strike"].sum())
+    n_prepares = int(gap_df["prepare_alert"].sum()) if "prepare_alert" in gap_df.columns else 0
+    if n_strikes > 0 or n_prepares > 0:
+        print(f"  {source} supplement: {n_strikes} strike + {n_prepares} prepare-alert minute(s) "
+              f"in {len(gap_range)}-min gap after GitHub CSV.", flush=True)
 
     return pd.concat([timeline, gap_df], ignore_index=True).sort_values("datetime").reset_index(drop=True)
 
