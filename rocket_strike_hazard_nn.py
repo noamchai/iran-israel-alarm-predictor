@@ -67,10 +67,12 @@ KAGGLE_ALERT_NAMES = [
     "red_alert.csv",
 ]
 OREF_ALERTS_URL = "https://www.oref.org.il/WarningMessages/alert/alerts.json"
+OREF_HISTORY_URL = "https://www.oref.org.il/WarningMessages/History/AlertsHistory.json"
 OREF_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0",
     "Referer": "https://www.oref.org.il/",
     "Accept": "application/json",
+    "X-Requested-With": "XMLHttpRequest",
 }
 # GitHub: historical Pikud Haoref alerts (no geo-restriction). https://github.com/dleshem/israel-alerts-data
 GITHUB_ALERTS_URL = "https://raw.githubusercontent.com/dleshem/israel-alerts-data/main/israel-alerts.csv"
@@ -172,6 +174,63 @@ def _read_csv_tail(path: Path, max_rows: int, encoding: str = "utf-8") -> Option
         return None
 
 
+def _fetch_oref_history_strike_minutes() -> set:
+    """Fetch AlertsHistory.json from Oref and return set of minute-floored timestamps
+    for rocket alerts (matrix_id=1). Returns empty set on failure (geo-restricted / network error).
+    This endpoint is updated within seconds of an alert — far more current than the GitHub CSV."""
+    if requests is None:
+        return set()
+    try:
+        r = requests.get(OREF_HISTORY_URL, headers=OREF_HEADERS, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return set()
+    if not isinstance(data, list):
+        return set()
+    minutes = set()
+    for alert in data:
+        if not isinstance(alert, dict):
+            continue
+        # Filter to rockets only (matrix_id=1); if field missing, include the alert
+        mid = alert.get("matrix_id") or alert.get("category")
+        if mid is not None:
+            try:
+                if int(mid) != 1:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        for key in ("alertDate", "alert_date", "alertdate", "datetime", "date"):
+            val = alert.get(key)
+            if val:
+                try:
+                    minutes.add(pd.to_datetime(val).floor("min"))
+                    break
+                except Exception:
+                    pass
+    return minutes
+
+
+def _supplement_with_oref_history(timeline: pd.DataFrame) -> pd.DataFrame:
+    """Patch recent Oref alert history into the minute timeline.
+    Covers the gap between the GitHub CSV (hours stale) and now (seconds stale)."""
+    recent_minutes = _fetch_oref_history_strike_minutes()
+    if not recent_minutes:
+        return timeline
+    cutoff = pd.Timestamp.now().floor("min") - pd.Timedelta(hours=25)
+    recent_in_range = {m for m in recent_minutes if m >= cutoff}
+    if not recent_in_range:
+        return timeline
+    timeline = timeline.copy()
+    mask = timeline["datetime"].isin(recent_in_range) & (timeline["strike"] == 0)
+    if mask.any():
+        n = int(mask.sum())
+        print(f"  Oref history supplement: adding {n} recent strike minute(s) not in GitHub CSV.", flush=True)
+        timeline.loc[mask, "strike"] = 1
+        timeline.loc[mask, "strike_count"] = 1
+    return timeline
+
+
 def _fetch_github_alerts_minute(
     force_refresh: bool = False,
     max_cache_age_minutes: Optional[float] = 60,
@@ -225,7 +284,10 @@ def _fetch_github_alerts_minute(
             return None
     except Exception:
         return None
-    return _minute_timeline_from_parsed_df(df)
+    result = _minute_timeline_from_parsed_df(df)
+    if result is not None:
+        result = _supplement_with_oref_history(result)
+    return result
 
 
 def _minute_timeline_from_parsed_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
