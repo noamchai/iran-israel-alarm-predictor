@@ -278,7 +278,12 @@ def _run_hawkes(df: pd.DataFrame) -> dict:
     if "prepare_alert_in_last_15min" in df.columns:
         recent_prep = int(df["prepare_alert_in_last_15min"].iloc[-1])
         mins_since_prep = float(df["minutes_since_last_prepare"].iloc[-1])
-        if recent_prep > 0 and mins_since_prep <= 10:
+        # Only boost if no rocket strike has occurred AFTER the prepare alert.
+        # If strikes already arrived (minutes_since_last_strike < mins_since_prep),
+        # the Hawkes model already sees those strikes — double-boosting is wrong.
+        mins_since_strike = float(df["minutes_since_last_strike"].iloc[-1]) if "minutes_since_last_strike" in df.columns else 999999.0
+        rockets_arrived_after_prepare = mins_since_strike < mins_since_prep
+        if recent_prep > 0 and mins_since_prep <= 10 and not rockets_arrived_after_prepare:
             prepare_boost_active = True
             # Scale per-minute probabilities: boost decays as prepare alert ages
             boost = 2.0 * max(0.0, 1.0 - mins_since_prep / 10.0)  # 2× at t=0, 1× at t=10min
@@ -289,6 +294,9 @@ def _run_hawkes(df: pd.DataFrame) -> dict:
                 cs = min(1.0, cs + p)
                 cumulative.append(cs)
             print(f"  Prepare-alert boost: {boost:.2f}x (mins_since={mins_since_prep:.0f})", flush=True)
+        elif recent_prep > 0 and rockets_arrived_after_prepare:
+            print(f"  Prepare-alert boost skipped: rockets already arrived after prepare alert "
+                  f"(mins_since_prepare={mins_since_prep:.0f}, mins_since_strike={mins_since_strike:.0f})", flush=True)
 
     probs = {
         "1":  cumulative[0],
