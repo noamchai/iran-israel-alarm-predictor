@@ -215,12 +215,14 @@ def _fetch_oref_history_strike_minutes() -> set:
     return minutes
 
 
+_ISRAEL_TZ_OFFSET = pd.Timedelta(hours=2)  # Israel = UTC+2 (winter); timeline datetimes are Israeli local (tz-naive)
+
+
 def _fetch_tzevaadom_strike_minutes() -> set:
     """Fetch recent alerts from api.tzevaadom.co.il/alerts-history (globally accessible, no geo-restriction).
-    Returns set of minute-floored UTC timestamps for non-drill alerts.
-    Response: list of {id, alerts: [{time (unix), cities, threat, isDrill}]}
-    threat field is NOT a category code: observed values are 0 (rockets, central Israel)
-    and 5 (border areas, Hezbollah/Houthi). Include all non-drill alerts."""
+    Returns set of minute-floored ISRAELI-TIME (tz-naive) timestamps for non-drill alerts.
+    Response: list of {id, alerts: [{time (unix/UTC), cities, threat, isDrill}]}
+    Converts UTC → Israeli local time to match the GitHub CSV timeline timezone."""
     if requests is None:
         return set()
     try:
@@ -243,37 +245,52 @@ def _fetch_tzevaadom_strike_minutes() -> set:
             ts = alert.get("time")
             if ts is not None:
                 try:
-                    minutes.add(pd.Timestamp(int(ts), unit="s").floor("min"))
+                    # Convert UTC unix → Israeli local time (tz-naive, matching GitHub CSV)
+                    il_time = (pd.Timestamp(int(ts), unit="s") + _ISRAEL_TZ_OFFSET).floor("min")
+                    minutes.add(il_time)
                 except Exception:
                     pass
     return minutes
 
 
 def _supplement_with_oref_history(timeline: pd.DataFrame) -> pd.DataFrame:
-    """Patch recent alert history into the minute timeline using two sources:
-    1. Oref AlertsHistory.json — seconds-fresh, Israeli IPs only
-    2. tzevaadom.co.il alerts-history — seconds-fresh, globally accessible (no geo-restriction)
-    Covers the gap between the GitHub CSV (hours stale) and now."""
+    """Fill the gap between the last GitHub CSV row and now using real-time alert sources.
+    Only adds minutes AFTER the last GitHub CSV timestamp — never overwrites historical data.
+    Sources (tried in order):
+      1. Oref AlertsHistory.json — seconds-fresh, Israeli IPs only
+      2. tzevaadom.co.il alerts-history — seconds-fresh, globally accessible"""
+    last_ts = timeline["datetime"].max()
+    now_floor = pd.Timestamp.now().floor("min")
+    if pd.isna(last_ts) or last_ts >= now_floor:
+        return timeline
+
     # Try Oref first (Israeli IPs); fall back to tzevaadom (global)
-    recent_minutes = _fetch_oref_history_strike_minutes()
+    gap_minutes = _fetch_oref_history_strike_minutes()
     source = "Oref"
-    if not recent_minutes:
-        recent_minutes = _fetch_tzevaadom_strike_minutes()
+    if not gap_minutes:
+        gap_minutes = _fetch_tzevaadom_strike_minutes()
         source = "tzevaadom"
-    if not recent_minutes:
+    if not gap_minutes:
         return timeline
-    cutoff = pd.Timestamp.now().floor("min") - pd.Timedelta(hours=25)
-    recent_in_range = {m for m in recent_minutes if m >= cutoff}
-    if not recent_in_range:
+
+    # Keep only minutes strictly inside the gap (after last GitHub row, up to now)
+    strike_in_gap = {m for m in gap_minutes if last_ts < m <= now_floor}
+
+    # Build a full minute range for the gap, marking strikes
+    gap_range = pd.date_range(start=last_ts + pd.Timedelta(minutes=1), end=now_floor, freq="min")
+    if len(gap_range) == 0:
         return timeline
-    timeline = timeline.copy()
-    mask = timeline["datetime"].isin(recent_in_range) & (timeline["strike"] == 0)
-    if mask.any():
-        n = int(mask.sum())
-        print(f"  {source} history supplement: adding {n} recent strike minute(s) not in GitHub CSV.", flush=True)
-        timeline.loc[mask, "strike"] = 1
-        timeline.loc[mask, "strike_count"] = 1
-    return timeline
+    gap_df = pd.DataFrame({"datetime": gap_range})
+    gap_df["strike"] = gap_df["datetime"].isin(strike_in_gap).astype(int)
+    gap_df["strike_count"] = gap_df["strike"]
+    if "prepare_alert" in timeline.columns:
+        gap_df["prepare_alert"] = 0
+
+    n_strikes = int(gap_df["strike"].sum())
+    if n_strikes > 0:
+        print(f"  {source} history supplement: {n_strikes} strike minute(s) in {len(gap_range)}-min gap after GitHub CSV.", flush=True)
+
+    return pd.concat([timeline, gap_df], ignore_index=True).sort_values("datetime").reset_index(drop=True)
 
 
 def _fetch_github_alerts_minute(
