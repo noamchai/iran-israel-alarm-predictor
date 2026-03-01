@@ -218,6 +218,18 @@ def _fetch_oref_history_strike_minutes() -> set:
 _ISRAEL_TZ_OFFSET = pd.Timedelta(hours=2)  # Israel = UTC+2 (winter); timeline datetimes are Israeli local (tz-naive)
 
 
+def _now_israeli_time() -> pd.Timestamp:
+    """Return current time as Israeli local (tz-naive), matching GitHub CSV timezone.
+    Uses zoneinfo (Python 3.9+) for DST-aware conversion; falls back to UTC+2 offset.
+    IMPORTANT: pd.Timestamp.now() returns server local time, which is UTC on Render (US servers).
+    The GitHub CSV uses Israeli local time, so we must always convert explicitly."""
+    try:
+        from zoneinfo import ZoneInfo
+        return pd.Timestamp.now(tz=ZoneInfo("Asia/Jerusalem")).tz_localize(None)
+    except Exception:
+        return pd.Timestamp.utcnow() + _ISRAEL_TZ_OFFSET
+
+
 def _fetch_tzevaadom_strike_minutes() -> set:
     """Fetch recent alerts from api.tzevaadom.co.il/alerts-history (globally accessible, no geo-restriction).
     Returns set of minute-floored ISRAELI-TIME (tz-naive) timestamps for non-drill alerts.
@@ -260,7 +272,7 @@ def _supplement_with_oref_history(timeline: pd.DataFrame) -> pd.DataFrame:
       1. Oref AlertsHistory.json — seconds-fresh, Israeli IPs only
       2. tzevaadom.co.il alerts-history — seconds-fresh, globally accessible"""
     last_ts = timeline["datetime"].max()
-    now_floor = pd.Timestamp.now().floor("min")
+    now_floor = _now_israeli_time().floor("min")
     if pd.isna(last_ts) or last_ts >= now_floor:
         return timeline
 
@@ -731,7 +743,7 @@ def build_minute_timeline(
             minute_df = None
     if minute_df is None or len(minute_df) == 0:
         return None
-    end = end or pd.Timestamp(datetime.now()).floor("min")
+    end = end or _now_israeli_time().floor("min")
     if isinstance(end, str):
         end = pd.to_datetime(end).floor("min")
     last = minute_df["datetime"].max()
