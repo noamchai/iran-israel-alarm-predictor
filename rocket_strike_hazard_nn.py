@@ -174,10 +174,14 @@ def _read_csv_tail(path: Path, max_rows: int, encoding: str = "utf-8") -> Option
         return None
 
 
+TZEVAADOM_HISTORY_URL = "https://api.tzevaadom.co.il/alerts-history"
+
+
 def _fetch_oref_history_strike_minutes() -> set:
     """Fetch AlertsHistory.json from Oref and return set of minute-floored timestamps
     for rocket alerts (matrix_id=1). Returns empty set on failure (geo-restricted / network error).
-    This endpoint is updated within seconds of an alert — far more current than the GitHub CSV."""
+    This endpoint is updated within seconds of an alert — far more current than the GitHub CSV.
+    Only works from Israeli IPs; use _fetch_tzevaadom_strike_minutes() as global fallback."""
     if requests is None:
         return set()
     try:
@@ -211,10 +215,57 @@ def _fetch_oref_history_strike_minutes() -> set:
     return minutes
 
 
+def _fetch_tzevaadom_strike_minutes() -> set:
+    """Fetch recent alerts from api.tzevaadom.co.il/alerts-history (globally accessible, no geo-restriction).
+    Returns set of minute-floored UTC timestamps for non-drill rocket/missile alerts.
+    Response: list of {id, alerts: [{time (unix), cities, threat (1=rockets), isDrill}]}"""
+    if requests is None:
+        return set()
+    try:
+        r = requests.get(TZEVAADOM_HISTORY_URL, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return set()
+    if not isinstance(data, list):
+        return set()
+    minutes = set()
+    for group in data:
+        if not isinstance(group, dict):
+            continue
+        for alert in group.get("alerts", []):
+            if not isinstance(alert, dict):
+                continue
+            if alert.get("isDrill", False):
+                continue
+            # threat=1 = rockets/missiles (matches Oref matrix_id=1)
+            threat = alert.get("threat")
+            if threat is not None:
+                try:
+                    if int(threat) != 1:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            ts = alert.get("time")
+            if ts is not None:
+                try:
+                    minutes.add(pd.Timestamp(int(ts), unit="s").floor("min"))
+                except Exception:
+                    pass
+    return minutes
+
+
 def _supplement_with_oref_history(timeline: pd.DataFrame) -> pd.DataFrame:
-    """Patch recent Oref alert history into the minute timeline.
-    Covers the gap between the GitHub CSV (hours stale) and now (seconds stale)."""
+    """Patch recent alert history into the minute timeline using two sources:
+    1. Oref AlertsHistory.json — seconds-fresh, Israeli IPs only
+    2. tzevaadom.co.il alerts-history — seconds-fresh, globally accessible (no geo-restriction)
+    Covers the gap between the GitHub CSV (hours stale) and now."""
+    # Try Oref first (Israeli IPs); fall back to tzevaadom (global)
     recent_minutes = _fetch_oref_history_strike_minutes()
+    source = "Oref"
+    if not recent_minutes:
+        recent_minutes = _fetch_tzevaadom_strike_minutes()
+        source = "tzevaadom"
     if not recent_minutes:
         return timeline
     cutoff = pd.Timestamp.now().floor("min") - pd.Timedelta(hours=25)
@@ -225,7 +276,7 @@ def _supplement_with_oref_history(timeline: pd.DataFrame) -> pd.DataFrame:
     mask = timeline["datetime"].isin(recent_in_range) & (timeline["strike"] == 0)
     if mask.any():
         n = int(mask.sum())
-        print(f"  Oref history supplement: adding {n} recent strike minute(s) not in GitHub CSV.", flush=True)
+        print(f"  {source} history supplement: adding {n} recent strike minute(s) not in GitHub CSV.", flush=True)
         timeline.loc[mask, "strike"] = 1
         timeline.loc[mask, "strike_count"] = 1
     return timeline
