@@ -1126,21 +1126,28 @@ INDEX_HTML = """<!DOCTYPE html>
       // Status
       var updatedAt = (data.updated_at || '').replace('T', ' ').slice(0, 19);
       document.getElementById('updated').textContent = 'Updated ' + updatedAt + ' UTC';
-      var next = new Date();
-      next.setMinutes(next.getMinutes() + (5 - next.getMinutes() % 5));
-      next.setSeconds(0, 0);
-      document.getElementById('nextRefresh').textContent = 'Next refresh ~' + next.toLocaleTimeString();
-
       updateCharts(data);
     }
 
+    var FETCH_MS = 30000;
+    var _nextFetchAt = null;
+
+    function updateNextRefreshLabel() {
+      if (!_nextFetchAt) return;
+      var secsLeft = Math.max(0, Math.round((_nextFetchAt - Date.now()) / 1000));
+      document.getElementById('nextRefresh').textContent =
+        secsLeft > 0 ? 'Next refresh in ' + secsLeft + 's' : 'Refreshing\u2026';
+    }
+
     function fetchProbs() {
+      _nextFetchAt = Date.now() + FETCH_MS;
       fetch('/api/probs').then(function(r) { return r.json(); }).then(updateUI).catch(function(e) {
         updateUI({ ok: false, error: e.message });
       });
     }
     fetchProbs();
-    setInterval(fetchProbs, 30000);
+    setInterval(fetchProbs, FETCH_MS);
+    setInterval(updateNextRefreshLabel, 1000);
   </script>
 </body>
 </html>
