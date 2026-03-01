@@ -349,8 +349,9 @@ def _train_and_predict(max_rows: Optional[int] = None, keep_last_minutes: Option
                        train_on_all: bool = False):
     """Build timeline, train 1-min model, compute current probs. Uses true data only.
     keep_last_minutes: trim timeline to this many minutes so train and inference use the same distribution.
-    train_on_all: if True, train on ALL data (no test holdout) – use this for export so the model
-                  learns from the full current window including the most recent active period."""
+    train_on_all: if True, train on ALL data (no test holdout).
+    When train_on_all=False and alarms exist in the last 30 days, trains on all data except
+    the most recent 60 minutes (which becomes the held-out evaluation window)."""
     try:
         timeline = build_minute_timeline(max_rows=max_rows, keep_last_minutes=keep_last_minutes)
         if timeline is None or len(timeline) < 1000:
@@ -362,20 +363,29 @@ def _train_and_predict(max_rows: Optional[int] = None, keep_last_minutes: Option
             timeline = timeline.iloc[-MAX_MINUTE_ROWS:].reset_index(drop=True)
         df = hazard_features_minute(timeline)
         if train_on_all:
-            # For export: train on ALL rows so the model sees the full current active period.
-            # The train/test split would otherwise put recent strikes in the test set (they'd be
-            # invisible to the model), causing near-zero predictions during sudden escalations.
             train_df = df
         else:
-            if max_rows is not None:
-                test_minutes = max(300, int(0.2 * len(df)))
+            # If there were alarms in the last 30 days, include them in training but
+            # exclude only the last 60 minutes (the current prediction window).
+            cutoff_30d = df["datetime"].max() - pd.Timedelta(days=30)
+            recent_alarms = int(df.loc[df["datetime"] >= cutoff_30d, "strike"].sum())
+            if recent_alarms > 0:
+                cutoff_1h = df["datetime"].max() - pd.Timedelta(minutes=60)
+                train_df = df[df["datetime"] <= cutoff_1h].copy()
+                test_df = df[df["datetime"] > cutoff_1h].copy()
+                print(f"  Recent alarms: {recent_alarms} strike-min in last 30 days; "
+                      f"training up to {cutoff_1h.strftime('%Y-%m-%d %H:%M')} "
+                      f"(last 60 min held out).", flush=True)
             else:
-                test_minutes = 7 * 24 * 60
-            train_df, test_df = train_test_split_by_minutes(df, test_minutes=test_minutes)
-            if len(test_df) < 2:
-                n = len(df) - 1
-                split = int(0.8 * n)
-                train_df = df.iloc[: split + 1]
+                if max_rows is not None:
+                    test_minutes = max(300, int(0.2 * len(df)))
+                else:
+                    test_minutes = 7 * 24 * 60
+                train_df, test_df = train_test_split_by_minutes(df, test_minutes=test_minutes)
+                if len(test_df) < 2:
+                    n = len(df) - 1
+                    split = int(0.8 * n)
+                    train_df = df.iloc[: split + 1]
         X_train, y_train = build_sequences_hazard_minute(train_df, horizon_minutes=1)
         if X_train.size == 0 or y_train.sum() == 0:
             with _lock:
@@ -470,7 +480,7 @@ def _refresh_data_only(max_rows: Optional[int] = None, keep_last_minutes: Option
             sample_preds = predict_proba_strike(model, scaler, sample_X)
             if sample_preds.max() < 1e-100:
                 print("     Pretrained model gives near-zero predictions (likely out of distribution). Retraining on current window...", flush=True)
-                _train_and_predict(max_rows=_REFRESH_MAX_ROWS, keep_last_minutes=keep_last_minutes, train_on_all=True)
+                _train_and_predict(max_rows=_REFRESH_MAX_ROWS, keep_last_minutes=keep_last_minutes, train_on_all=False)
                 return
         # Hawkes overrides MLP for all predictions
         hk = _run_hawkes(df)
@@ -1171,6 +1181,11 @@ if __name__ == "__main__":
             print("  Failed to load model. Falling back to training.", flush=True)
             _train_and_predict()
             if _state["ready"]:
+                _REFRESH_MAX_ROWS = 120000
+                _KEEP_LAST_MINUTES = 30 * 24 * 60
+                t = threading.Thread(target=_background_refresh, daemon=True, kwargs={"max_rows": _REFRESH_MAX_ROWS, "keep_last_minutes": _KEEP_LAST_MINUTES})
+                t.start()
+            else:
                 t = threading.Thread(target=_background_refresh, daemon=True)
                 t.start()
     else:
@@ -1179,11 +1194,17 @@ if __name__ == "__main__":
             sys.exit(1)
         print("Rocket strike web app – loading data and training model (may take a minute)...", flush=True)
         _train_and_predict()
+        _bg_max_rows = None
+        _bg_keep_minutes = None
         if not _state["ready"]:
             print("Warning: model not ready.", _state.get("error"), flush=True)
         else:
-            print("Model ready. Starting server and 5-minute data refresh.", flush=True)
-        t = threading.Thread(target=_background_refresh, daemon=True)
+            # After full training, switch to recent-only refresh so background cycles are fast (~1 min)
+            _bg_max_rows = 120000
+            _bg_keep_minutes = 30 * 24 * 60
+            _REFRESH_MAX_ROWS = _bg_max_rows
+            print("Model ready. Starting server and live data refresh (~1 min cycles).", flush=True)
+        t = threading.Thread(target=_background_refresh, daemon=True, kwargs={"max_rows": _bg_max_rows, "keep_last_minutes": _bg_keep_minutes})
         t.start()
     app = create_app()
     print(f"  Listening on 0.0.0.0:{port}", flush=True)

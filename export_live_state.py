@@ -1,6 +1,7 @@
 """
 Train locally and export model + live_state for the web app.
-Use the SAME recent window the app uses (last 120k rows, 7d+5h) so predictions are not zero.
+Uses a 30-day window so the model sees recent alarms; excludes the last 60 minutes
+from training (they become the held-out evaluation window).
 
 Run locally:
   python export_live_state.py
@@ -27,21 +28,22 @@ from rocket_strike_app import (
     joblib,
 )
 
-# Train on last 120k CSV rows with train_on_all=True so the model sees the FULL recent window,
-# including the most current active period. Without train_on_all, the time-split would put the
-# most recent strikes in the test set, leaving the model with near-zero predictions during
-# sudden conflict escalations.
+# Load last 120k CSV rows; keep 30-day minute window so the model sees recent active periods.
+# If there are alarms in the last 30 days, trains on everything up to 60 min ago
+# (last 60 min held out as evaluation window). Falls back to 7-day test split if quiet.
 APP_WINDOW_ROWS = 120000
+KEEP_LAST_MINUTES = 30 * 24 * 60  # 30 days
 
 def main():
-    print(f"Training on last {APP_WINDOW_ROWS} CSV rows (full window, no test holdout) so predictions match reality...", flush=True)
-    _train_and_predict(max_rows=APP_WINDOW_ROWS, keep_last_minutes=None, train_on_all=True)
+    print(f"Training on last {APP_WINDOW_ROWS} CSV rows ({KEEP_LAST_MINUTES // 1440}d window; "
+          f"last 60 min excluded if recent alarms)...", flush=True)
+    _train_and_predict(max_rows=APP_WINDOW_ROWS, keep_last_minutes=KEEP_LAST_MINUTES, train_on_all=False)
     with _lock:
         err = _state.get("error") or ""
         need_fallback = not _state["ready"] and "no positives" in err.lower()
     if need_fallback:
         print("  No strikes in recent window; retrying with full data...", flush=True)
-        _train_and_predict(max_rows=None, train_on_all=True)
+        _train_and_predict(max_rows=None, train_on_all=False)
     with _lock:
         if not _state["ready"]:
             print("Error:", _state.get("error"), flush=True)

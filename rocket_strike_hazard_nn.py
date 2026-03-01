@@ -295,7 +295,7 @@ def _supplement_with_oref_history(timeline: pd.DataFrame) -> pd.DataFrame:
 
 def _fetch_github_alerts_minute(
     force_refresh: bool = False,
-    max_cache_age_minutes: Optional[float] = 60,
+    max_cache_age_minutes: Optional[float] = 5,
     max_rows: Optional[int] = None,
 ) -> Optional[pd.DataFrame]:
     """Fetch GitHub alerts and return minute-level timeline [datetime, strike, strike_count].
@@ -331,10 +331,15 @@ def _fetch_github_alerts_minute(
                 print("     Using cached alerts ({:.0f} min old).".format(age_min), flush=True)
         if should_fetch and requests is not None and (max_rows is None or not GITHUB_ALERTS_CACHE.exists()):
             print("     Re-fetching GitHub alerts (cache stale or --refresh)...", flush=True)
-            r = requests.get(GITHUB_ALERTS_URL, timeout=30)
-            r.raise_for_status()
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            GITHUB_ALERTS_CACHE.write_text(r.text, encoding="utf-8")
+            try:
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                r = requests.get(GITHUB_ALERTS_URL, timeout=120, stream=True)
+                r.raise_for_status()
+                with open(GITHUB_ALERTS_CACHE, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        f.write(chunk)
+            except Exception as _e:
+                print(f"     Re-fetch failed ({_e}); using cached copy.", flush=True)
         if GITHUB_ALERTS_CACHE.exists():
             if max_rows is not None:
                 df = _read_csv_tail(GITHUB_ALERTS_CACHE, max_rows)
