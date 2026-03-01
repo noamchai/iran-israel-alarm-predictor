@@ -217,8 +217,10 @@ def _fetch_oref_history_strike_minutes() -> set:
 
 def _fetch_tzevaadom_strike_minutes() -> set:
     """Fetch recent alerts from api.tzevaadom.co.il/alerts-history (globally accessible, no geo-restriction).
-    Returns set of minute-floored UTC timestamps for non-drill rocket/missile alerts.
-    Response: list of {id, alerts: [{time (unix), cities, threat (1=rockets), isDrill}]}"""
+    Returns set of minute-floored UTC timestamps for non-drill alerts.
+    Response: list of {id, alerts: [{time (unix), cities, threat, isDrill}]}
+    threat field is NOT a category code: observed values are 0 (rockets, central Israel)
+    and 5 (border areas, Hezbollah/Houthi). Include all non-drill alerts."""
     if requests is None:
         return set()
     try:
@@ -238,14 +240,6 @@ def _fetch_tzevaadom_strike_minutes() -> set:
                 continue
             if alert.get("isDrill", False):
                 continue
-            # threat=1 = rockets/missiles (matches Oref matrix_id=1)
-            threat = alert.get("threat")
-            if threat is not None:
-                try:
-                    if int(threat) != 1:
-                        continue
-                except (TypeError, ValueError):
-                    pass
             ts = alert.get("time")
             if ts is not None:
                 try:
